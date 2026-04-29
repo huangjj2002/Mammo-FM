@@ -1,65 +1,64 @@
 """
-入口脚本 —— 所有配置变量集中在此，方便修改。
 修改下方变量后直接运行即可：
-    python run_finetune.py
+python run_finetune.py
 """
 
 # =============================================================================
-# ========================= 配置区域（按需修改） ==============================
+# ========================= 配置区域 ==============================
 # =============================================================================
 
 # ---- 路径 ----
-DATA_DIR         = r"/mnt/g/data"                   # 数据根目录
-IMG_DIR          = "images_png"                  # 图片目录（相对于 DATA_DIR，也可用绝对路径）
-CSV_FILE         = "train_with_test_data_mini.csv"    # CSV文件（相对于 DATA_DIR，也可用绝对路径）
-CLIP_CHK_PT_PATH = r"/mnt/g/Mammo_CLIP_PROJECT/Mammo_FM/Mammo-FM/model/Mammo-FM_BatmanlabTrained_CLIP.tar"
-OUTPUT_DIR       = r"/mnt/g/Mammo_CLIP_PROJECT/Mammo_FM/Mammo-FM/output/finetune_cancer"
-FOLD_CSV         = None                          # fold CSV保存路径，None则自动生成在CSV同目录
+DATA_DIR         = r"/opt/localdata/Data/dh/dh_preprocessed/hjj_images"                   # 数据根目录
+IMG_DIR          = "images_png"                  # 图片目录
+CSV_FILE         = "embed_data_testcohort_enriched.csv"    # CSV文件
+CLIP_CHK_PT_PATH = r"./model/Mammo-FM_BatmanlabTrained_CLIP.tar"
+OUTPUT_DIR       = r"./output/finetune_cancer"
+FOLD_CSV         = None                         
 
-# ---- 数据集 / 任务 ----
-DATASET          = "Custom"                      # 数据集名称（仅用于日志标识，不影响逻辑）
-DATA_FRAC        = "1.0"                         # 训练数据使用比例
-LABEL            = "cancer"                      # CSV中的标签列名
-ARCH             = "breast_clip_det_b5_period_n_ft"  # "breast_clip_det_b5_period_n_lp"=线性探针, "breast_clip_det_b5_period_n_ft"=全量微调
 
-# ---- 训练 ----
+DATASET          = "Custom"                      
+DATA_FRAC        = "1.0"                       
+LABEL            = "cancer"                      
+ARCH             = "breast_clip_det_b5_period_n_ft"  
+
 N_FOLDS          = 5       # 交叉验证折数
-EPOCHS           = 10      # 每折最大训练轮数
-EARLY_STOP       = 5       # 早停耐心值（0=禁用）
-BATCH_SIZE       = 2       # 批大小
+EPOCHS           = 25      # 每折最大训练轮数
+EARLY_STOP       = 5       # 早停参数（0=禁用）
+BATCH_SIZE       = 16       # 批大小
 LR               = 5e-5    # 学习率
-WEIGHT_DECAY     = 1e-4    # 权重衰减
-WARMUP_EPOCHS    = 1       # 预热轮数
-WEIGHTED_BCE     = "n"     # 是否使用加权BCE ("y"/"n")
-SEED             = 42      # 随机种子
-NUM_WORKERS      = 2       # 数据加载线程数
+WEIGHT_DECAY     = 1e-4    
+WARMUP_EPOCHS    = 1       
+WEIGHTED_BCE     = "y"     
+SEED             = 42     
+NUM_WORKERS      = 4       
 
-# ---- 图片 ----
+
 IMG_SIZE         = [1520, 912]  # 图片尺寸 [高, 宽]
 
-# ---- 系统 ----
-DEVICE           = "cuda"  # 设备 ("cuda" 或 "cpu")
-APEX             = "y"     # 混合精度 ("y"/"n")
-PRINT_FREQ       = 50      # 训练日志打印频率（每N步）
-LOG_FREQ         = 200     # TensorBoard日志频率（每N步）
 
-# ---- 数据增强 ----
-ALPHA            = 10      # ElasticTransform alpha
-SIGMA            = 15      # ElasticTransform sigma
-P                = 1.0     # 增强概率
+DEVICE           = "cuda"  
+GPU_ID           = 0    #设置使用的GPU   
+APEX             = "y"     
+PRINT_FREQ       = 50      
+LOG_FREQ         = 200    
 
-# ---- 归一化 ----
+
+ALPHA            = 10      
+SIGMA            = 15      
+P                = 1.0     
+
+
 MEAN             = 0.3089279
 STD              = 0.25053555408335154
 
-# =============================================================================
-# =========================== 运行（无需修改） ===============================
-# =============================================================================
 
+
+import os
 import sys
 from pathlib import Path
 
-# 确保从脚本所在目录运行也能找到模块
+os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU_ID)
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from finetune_cancer import main as _main
@@ -67,7 +66,7 @@ import argparse
 
 
 def build_args():
-    """将上方变量转为 argparse.Namespace 对象。"""
+  
     args = argparse.Namespace(
         data_dir=DATA_DIR,
         img_dir=IMG_DIR,
@@ -92,6 +91,7 @@ def build_args():
         num_workers=NUM_WORKERS,
         img_size=IMG_SIZE,
         device=DEVICE,
+        gpu_id=GPU_ID,
         apex=APEX,
         print_freq=PRINT_FREQ,
         log_freq=LOG_FREQ,

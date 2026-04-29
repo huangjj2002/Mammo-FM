@@ -1,47 +1,4 @@
-"""
-5-Fold Cross-Validation Fine-tuning Script for Breast Cancer Detection
-using Mammo-FM pre-trained backbone.
 
-Features:
-  - Stratified 5-fold splitting on training data (patient-level grouping)
-  - Early stopping per fold
-  - Saves best model from each fold
-  - Ensemble prediction on ALL data using 5 best models
-  - Outputs CSV with fold + pred_score + pred_label columns
-
-Usage:
-    cd /mnt/g/Mammo_CLIP_PROJECT/Mammo_FM/Mammo-FM-main
-
-    # View all available parameters:
-    python finetune_cancer.py --help
-
-    # Run with default settings (all defaults are pre-filled):
-    python finetune_cancer.py
-
-    # Run with custom parameters:
-    python finetune_cancer.py ^
-        --data-dir "/mnt/g/data" ^
-        --img-dir "images_png" ^
-        --csv-file "train_with_test_data.csv" ^
-        --clip_chk_pt_path "/mnt/g/Mammo_CLIP_PROJECT/Mammo_FM/Mammo-FM-main\\model\\Mammo-FM_BatmanlabTrained_CLIP.tar" ^
-        --output-dir "/mnt/g/Mammo_CLIP_PROJECT/Mammo_FM/Mammo-FM-main\\output\\finetune_cancer" ^
-        --arch "breast_clip_det_b5_period_n_ft" ^
-        --epochs 10 ^
-        --batch-size 4 ^
-        --lr 5e-5 ^
-        --weighted-BCE "n"
-
-    # Or use absolute paths directly for img-dir and csv-file:
-    python finetune_cancer.py ^
-        --img-dir "/mnt/g/data/images_png" ^
-        --csv-file "/mnt/g/data/train_with_test_data.csv" ^
-        --clip_chk_pt_path "/mnt/g/Mammo_CLIP_PROJECT/Mammo_FM/Mammo-FM-main\\model\\Mammo-FM_BatmanlabTrained_CLIP.tar"
-"""
-
-# ---------------------------------------------------------------------------
-# Early --help handling: allows ``python finetune_cancer.py --help`` to work
-# WITHOUT requiring any third-party packages to be installed.
-# ---------------------------------------------------------------------------
 import sys
 
 if "--help" in sys.argv or "-h" in sys.argv:
@@ -50,7 +7,7 @@ if "--help" in sys.argv or "-h" in sys.argv:
         description="5-Fold CV fine-tuning for breast cancer detection using Mammo-FM",
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    # ---- Paths ----
+
     _p.add_argument("--data-dir", default="/mnt/g/data", type=str,
                     help="Root data directory. --img-dir and --csv-file can be relative to this directory (default: /mnt/g/data)")
     _p.add_argument("--img-dir", default="images_png", type=str,
@@ -65,14 +22,14 @@ if "--help" in sys.argv or "-h" in sys.argv:
                     type=str, help="Directory for checkpoints, logs, and predictions")
     _p.add_argument("--fold-csv", default=None, type=str,
                     help="Path to save the CSV with fold column. Default: next to --csv-file as *_folds.csv")
-    # ---- Dataset / Task ----
+ 
     _p.add_argument("--dataset", default="Custom", type=str, help="Dataset name, for logging only (default: Custom)")
     _p.add_argument("--data_frac", default="1.0", type=str, help="Fraction of training data to use (default: 1.0)")
     _p.add_argument("--label", default="cancer", type=str, help="Label column name in CSV (default: cancer)")
     _p.add_argument("--arch", default="breast_clip_det_b5_period_n_ft",
                     choices=["breast_clip_det_b5_period_n_lp", "breast_clip_det_b5_period_n_ft"],
                     help="lp=linear probe (frozen backbone), ft=full fine-tuning (default: breast_clip_det_b5_period_n_ft)")
-    # ---- Training ----
+
     _p.add_argument("--n_folds", default=5, type=int, help="Number of CV folds (default: 5)")
     _p.add_argument("--epochs", default=10, type=int, help="Max epochs per fold (default: 10)")
     _p.add_argument("--early-stop", default=5, type=int, help="Early stopping patience, 0=disabled (default: 5)")
@@ -87,24 +44,23 @@ if "--help" in sys.argv or "-h" in sys.argv:
     _p.add_argument("--img-size", nargs="+", default=[1520, 912], type=int, help="Image size [H W] (default: 1520 912)")
     _p.add_argument("--seed", default=42, type=int, help="Random seed (default: 42)")
     _p.add_argument("--num-workers", default=2, type=int, help="DataLoader num_workers (default: 2)")
-    # ---- System ----
+
+    _p.add_argument("--gpu-id", default=0, type=int, help="GPU device ID to use (default: 0)")
     _p.add_argument("--device", default="cuda", type=str, help="Device: cuda or cpu (default: cuda)")
     _p.add_argument("--apex", default="y", type=str, help="AMP mixed precision: y/n (default: y)")
     _p.add_argument("--print-freq", default=50, type=int, help="Print training stats every N steps (default: 50)")
     _p.add_argument("--log-freq", default=200, type=int, help="Log to TensorBoard every N steps (default: 200)")
-    # ---- Augmentation ----
+
     _p.add_argument("--alpha", default=10, type=float, help="ElasticTransform alpha (default: 10)")
     _p.add_argument("--sigma", default=15, type=float, help="ElasticTransform sigma (default: 15)")
     _p.add_argument("--p", default=1.0, type=float, help="Augmentation probability (default: 1.0)")
-    # ---- Normalization ----
+
     _p.add_argument("--mean", default=0.3089279, type=float, help="Image normalization mean (default: 0.3089279)")
     _p.add_argument("--std", default=0.25053555408335154, type=float, help="Image normalization std (default: 0.25053555408335154)")
     _p.parse_args(["--help"])
-    # --help exits the process above; the rest of this file is never reached.
 
-# ---------------------------------------------------------------------------
-# Normal imports (only reached when NOT showing --help)
-# ---------------------------------------------------------------------------
+
+
 import argparse
 import gc
 import os
@@ -132,9 +88,7 @@ from utils import seed_all, AverageMeter, timeSince
 from breastclip.scheduler import LinearWarmupCosineAnnealingLR
 
 
-# =============================================================================
-# Dataset
-# =============================================================================
+
 
 class CustomMammoDataset(Dataset):
     """Dataset for breast cancer classification from custom CSV + PNG images."""
@@ -182,9 +136,7 @@ def collate_fn(batch):
     }
 
 
-# =============================================================================
-# Transforms
-# =============================================================================
+
 
 def get_train_transform(img_size=(1520, 912), alpha=10, sigma=15, p=1.0):
     return Compose([
@@ -204,9 +156,7 @@ def get_val_transform(img_size=(1520, 912)):
     ])
 
 
-# =============================================================================
-# Early Stopping
-# =============================================================================
+
 
 class EarlyStopping:
     """Stop training when validation AUROC has not improved for `patience` epochs."""
@@ -219,7 +169,7 @@ class EarlyStopping:
         if val_auroc > self.best_score:
             self.best_score = val_auroc
             self.counter = 0
-            return False  # don't stop, new best
+            return False  
         else:
             self.counter += 1
             if self.counter >= self.patience:
@@ -231,24 +181,10 @@ class EarlyStopping:
         self.counter = 0
 
 
-# =============================================================================
-# Stratified K-Fold Splitting
-# =============================================================================
+
 
 def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=None):
-    """Create stratified k-fold splits on training data, leave test set as fold=-1.
 
-    Folds are split at **patient level** using ``StratifiedGroupKFold`` so that
-    all images from the same patient stay in the same fold.  If positive patients
-    are too few for ``StratifiedGroupKFold`` to produce balanced folds, the
-    function falls back to a manual stratified split. If there are fewer
-    positive patients than folds, some validation folds cannot contain positives
-    and the function warns about that explicitly.
-
-    Saves a new CSV with a ``fold`` column. The original CSV is never overwritten.
-
-    Returns the output path.
-    """
     rng = np.random.RandomState(seed)
 
     df = pd.read_csv(csv_path)
@@ -267,7 +203,7 @@ def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=N
     if train_df.empty:
         raise ValueError("No rows with split == 'training'; cannot create CV folds.")
 
-    # --- Patient-level aggregation ---
+
     patient_info = train_df.groupby("patient_id").agg(
         label=(label_col, "max"),
         n_images=("image_id", "count"),
@@ -294,7 +230,7 @@ def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=N
     else:
         use_manual = False
 
-    # === Manual greedy stratified split (fallback) ===
+
     if use_manual:
         rng.shuffle(pos_patients)
         rng.shuffle(neg_patients)
@@ -307,7 +243,7 @@ def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=N
             fold_mask = train_df["patient_id"].isin(fold_patients)
             df.loc[train_df[fold_mask].index, "fold"] = fold_id
 
-    # === StratifiedGroupKFold (normal path) ===
+
     else:
         patient_ids = patient_info["patient_id"].values
         y_patient = patient_info["label"].values.astype(int)
@@ -331,7 +267,7 @@ def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=N
                 fold_mask = train_df["patient_id"].isin(fold_patients)
                 df.loc[train_df[fold_mask].index, "fold"] = fold_id
 
-    # === Post-check: ensure every fold has at least one positive patient ===
+
     fold_ok = True
     for f in range(n_folds):
         f_pos_patients = df[(df["fold"] == f) & (df[label_col] == 1)]["patient_id"].nunique()
@@ -347,7 +283,7 @@ def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=N
     if not fold_ok:
         print("[Folds] FOLD BALANCE CHECK WARNING. Continuing because patient-level grouping is prioritized.")
 
-    # Determine output path
+
     csv_path = Path(csv_path)
     if output_path is None:
         output_path = csv_path.parent / f"{csv_path.stem}_folds{csv_path.suffix}"
@@ -369,9 +305,7 @@ def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=N
     return output_path
 
 
-# =============================================================================
-# Train / Validate one epoch
-# =============================================================================
+
 
 def train_epoch(model, loader, criterion, optimizer, scheduler, scaler, epoch, total_epochs, args, logger, device):
     model.train()
@@ -449,19 +383,12 @@ def valid_epoch(model, loader, criterion, epoch, total_epochs, args, device):
     return losses.avg, predictions
 
 
-# =============================================================================
-# Full-dataset prediction using ensemble of fold models
-# =============================================================================
+
 
 @torch.no_grad()
 def predict_all(model_paths, df_all, img_dir, args, device, threshold=None):
-    """Run inference on all data using an ensemble of fold models.
 
-    Returns ensemble scores/labels plus per-fold model scores/labels. The number
-    of per-fold outputs follows ``len(model_paths)``, so 4-fold CV produces four
-    single-model prediction files plus one ensemble file.
-    """
-    # Load base checkpoint config once
+
     base_ckpt = torch.load(args.clip_chk_pt_path, map_location="cpu", weights_only=False)
     if base_ckpt["config"]["model"]["image_encoder"]["model_type"] == "cnn":
         args.image_encoder_type = base_ckpt["config"]["model"]["image_encoder"]["name"]
@@ -512,35 +439,27 @@ def predict_all(model_paths, df_all, img_dir, args, device, threshold=None):
 
         torch.cuda.empty_cache()
 
-    # Average across folds
+
     pred_score = np.mean(all_scores, axis=0)
 
-    # Do not derive the threshold from df_all here: df_all may include held-out
-    # test rows, so using its labels would leak test information into pred_label.
+
     pred_label = (pred_score >= th).astype(int)
     print(f"[Predict] Binarization threshold: {th:.4f}")
 
     return pred_score, pred_label, per_fold_outputs
 
 
-# =============================================================================
-# Main
-# =============================================================================
+
 
 def main(args=None):
-    """Main entry point.
 
-    Can be called in two ways:
-      1. ``main()``          — parses args from command line (python finetune_cancer.py ...)
-      2. ``main(namespace)`` — receives an argparse.Namespace from run_finetune.py
-    """
     if args is None:
         parser = argparse.ArgumentParser(
             description="5-Fold CV fine-tuning for breast cancer detection using Mammo-FM",
             formatter_class=argparse.RawTextHelpFormatter,
         )
 
-        # ---- Paths ----
+
         parser.add_argument("--data-dir",
                             default="/mnt/g/data",
                             type=str,
@@ -570,7 +489,7 @@ def main(args=None):
                             help="Path to save the CSV with fold column. "
                                  "Default: next to --csv-file as *_folds.csv")
 
-        # ---- Dataset / Task ----
+
         parser.add_argument("--dataset",
                             default="Custom",
                             type=str,
@@ -589,7 +508,7 @@ def main(args=None):
                             help="lp=linear probe (frozen backbone), ft=full fine-tuning "
                                  "(default: breast_clip_det_b5_period_n_ft)")
 
-        # ---- Training ----
+
         parser.add_argument("--n_folds", default=5, type=int,
                             help="Number of CV folds (default: 5)")
         parser.add_argument("--epochs", default=10, type=int,
@@ -615,7 +534,9 @@ def main(args=None):
         parser.add_argument("--num-workers", default=2, type=int,
                             help="DataLoader num_workers (default: 2)")
 
-        # ---- System ----
+
+        parser.add_argument("--gpu-id", default=0, type=int,
+                            help="GPU device ID to use (default: 0)")
         parser.add_argument("--device", default="cuda", type=str,
                             help="Device: cuda or cpu (default: cuda)")
         parser.add_argument("--apex", default="y", type=str,
@@ -625,7 +546,7 @@ def main(args=None):
         parser.add_argument("--log-freq", default=200, type=int,
                             help="Log to TensorBoard every N steps (default: 200)")
 
-        # ---- Augmentation ----
+
         parser.add_argument("--alpha", default=10, type=float,
                             help="ElasticTransform alpha (default: 10)")
         parser.add_argument("--sigma", default=15, type=float,
@@ -633,7 +554,7 @@ def main(args=None):
         parser.add_argument("--p", default=1.0, type=float,
                             help="Augmentation probability (default: 1.0)")
 
-        # ---- Normalization ----
+
         parser.add_argument("--mean", default=0.3089279, type=float,
                             help="Image normalization mean (default: 0.3089279)")
         parser.add_argument("--std", default=0.25053555408335154, type=float,
@@ -641,9 +562,11 @@ def main(args=None):
 
         args = parser.parse_args()
 
-    # =========================================================================
-    # Resolve paths: support both relative (to data-dir) and absolute paths
-    # =========================================================================
+
+    # ---- 设置可见 GPU（必须在 torch.cuda 相关操作之前） ----
+    gpu_id = int(getattr(args, "gpu_id", 0))
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
     data_dir = Path(args.data_dir)
 
     if os.path.isabs(args.img_dir):
@@ -656,7 +579,7 @@ def main(args=None):
     else:
         args.data_csv = data_dir / args.csv_file
 
-    # ---- Setup ----
+
     args.apex = str(args.apex).lower() == "y"
     args.weighted_bce = str(args.weighted_BCE).lower() == "y"
     args.data_frac = float(args.data_frac)
@@ -681,40 +604,34 @@ def main(args=None):
     print(f"Weighted BCE: {args.weighted_bce}  |  AMP: {args.apex}")
     print("=" * 60)
 
-    # =========================================================================
-    # Step 1 — Create stratified folds
-    # =========================================================================
+
     folds_csv = create_folds(args.data_csv, label_col=args.label,
                              n_folds=args.n_folds, seed=args.seed,
                              output_path=args.fold_csv)
     df = pd.read_csv(folds_csv)
 
-    # =========================================================================
-    # Step 2 — Train one model per fold
-    # =========================================================================
-    # Load base checkpoint config once for all folds
+
     base_ckpt = torch.load(args.clip_chk_pt_path, map_location="cpu", weights_only=False)
     if base_ckpt["config"]["model"]["image_encoder"]["model_type"] == "cnn":
         args.image_encoder_type = base_ckpt["config"]["model"]["image_encoder"]["name"]
     else:
         args.image_encoder_type = base_ckpt["config"]["model"]["image_encoder"]["model_type"]
 
-    fold_model_paths = []   # (fold_id, path) for best models per fold
-    oof_parts = []          # out-of-fold validation predictions from each best epoch
+    fold_model_paths = []   
+    oof_parts = []          
 
     for fold in range(args.n_folds):
         print(f"\n{'=' * 60}")
         print(f"  Fold {fold} / {args.n_folds}")
         print(f"{'=' * 60}")
 
-        seed_all(args.seed)  # reset seed per fold for reproducibility
+        seed_all(args.seed)  
 
-        # Split: train = all non-test rows NOT in current fold
-        #        valid = rows in current fold
+
         train_df = df[(df["fold"] != -1) & (df["fold"] != fold)].reset_index(drop=True)
         valid_df = df[df["fold"] == fold].reset_index(drop=True)
 
-        # Apply data_frac
+   
         if args.data_frac < 1.0:
             train_df = train_df.sample(frac=args.data_frac, random_state=args.seed).reset_index(drop=True)
 
@@ -722,7 +639,7 @@ def main(args=None):
         print(f"  Train cancer%: {train_df[args.label].mean()*100:.1f}%")
         print(f"  Valid cancer%: {valid_df[args.label].mean()*100:.1f}%")
 
-        # Warn if valid set has only one class (AUROC undefined)
+    
         n_valid_classes = valid_df[args.label].nunique()
         if n_valid_classes < 2:
             print(f"  WARNING: Valid set for fold {fold} has only {n_valid_classes} class(es). "
@@ -750,7 +667,7 @@ def main(args=None):
             print(f"  WARNING: Fold {fold} produced no train or valid batches; skipping.")
             continue
 
-        # ---- Build model ----
+
         model = BreastClipClassifier(args, ckpt=base_ckpt, n_class=1)
         model = model.to(device)
         print(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -778,7 +695,7 @@ def main(args=None):
         early_stopper = EarlyStopping(patience=args.early_stop) if args.early_stop > 0 else None
         best_auroc = -float("inf")
         best_model_path = ckpt_dir / f"best_fold{fold}_seed{args.seed}.pth"
-        saved_best = False  # track whether we actually saved a best model
+        saved_best = False  
         best_predictions = None
         best_metrics = None
         last_predictions = None
@@ -820,7 +737,7 @@ def main(args=None):
                     print(f"  -> Early stopping at epoch {epoch+1} (best AUROC={early_stopper.best_score:.4f})")
                     break
 
-            # If no best model was ever saved (e.g. all AUROCs were -inf), save the last epoch
+
             if not saved_best:
                 print(f"  WARNING: No best model was saved for fold {fold}. "
                       f"Saving last epoch as fallback.")
@@ -832,7 +749,7 @@ def main(args=None):
 
         except Exception as e:
             print(f"  ERROR: Fold {fold} training failed with exception: {e}")
-            # Try to save whatever we have as a fallback
+    
             if not saved_best:
                 try:
                     torch.save({"epoch": -1, "model": model.state_dict(),
@@ -856,9 +773,7 @@ def main(args=None):
         torch.cuda.empty_cache()
         gc.collect()
 
-    # =========================================================================
-    # Step 3 — Full ensemble prediction on ALL data
-    # =========================================================================
+
     print(f"\n{'=' * 60}")
     print("  Ensemble prediction on ALL data")
     print(f"{'=' * 60}")
@@ -883,7 +798,7 @@ def main(args=None):
         fold_model_paths, df_all, args.img_dir, args, device, threshold=threshold
     )
 
-    # ---- Save one full-dataset prediction CSV per fold model ----
+
     prediction_stem = Path(args.data_csv).stem
     for fold_output in per_fold_outputs:
         fold_id = fold_output["fold"]
@@ -895,7 +810,7 @@ def main(args=None):
         fold_df.to_csv(fold_csv, index=False)
         print(f"[Final] Fold {fold_id} predictions saved -> {fold_csv}")
 
-    # ---- Save ensemble full-dataset prediction CSV ----
+
     df_all["pred_score"] = pred_score
     df_all["pred_label"] = pred_label
     df_all["source_model"] = "ensemble"
