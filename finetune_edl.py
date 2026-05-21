@@ -93,8 +93,10 @@ if "--help" in sys.argv or "-h" in sys.argv:
                     help="Legacy alias for KL divergence lambda weight (default: 0.1)")
     _p.add_argument("--edl-kl-weight", default=None, type=float,
                     help="KL divergence lambda weight. Overrides --annealing-coef when set")
+    _p.add_argument("--annealing-step", default=None, type=float,
+                    help="KL annealing step in epochs. Uses lambda=min(1,(epoch+1)/step)*kl_weight when set")
     _p.add_argument("--annealing-start-frac", default=0.0, type=float,
-                    help="Fraction of total epochs before starting KL annealing (default: 0.0)")
+                    help="Legacy fallback: fraction of total epochs before starting KL annealing (default: 0.0)")
 
     _p.parse_args(["--help"])
 
@@ -903,6 +905,7 @@ def main(args=None):
         parser.add_argument("--edl-loss-type", default="log", choices=["log", "digamma", "mse"])
         parser.add_argument("--annealing-coef", default=0.1, type=float)
         parser.add_argument("--edl-kl-weight", default=None, type=float)
+        parser.add_argument("--annealing-step", default=None, type=float)
         parser.add_argument("--annealing-start-frac", default=0.0, type=float)
 
         args = parser.parse_args()
@@ -924,6 +927,14 @@ def main(args=None):
         args.edl_kl_weight = float(args.annealing_coef)
     if not hasattr(args, "annealing_start_frac"):
         args.annealing_start_frac = getattr(args, "annealing_start_frac", 0.0)
+    if not hasattr(args, "annealing_step"):
+        args.annealing_step = getattr(args, "annealing_step", None)
+    if args.annealing_step in ("",):
+        args.annealing_step = None
+    if args.annealing_step is not None:
+        args.annealing_step = float(args.annealing_step)
+        if args.annealing_step <= 0:
+            raise ValueError(f"annealing_step must be > 0, got {args.annealing_step}")
     if not hasattr(args, "weighted_BCE"):
         args.weighted_BCE = getattr(args, "weighted_bce", "y")
     args.weighted_bce = str(args.weighted_BCE).lower() in {"1", "true", "t", "yes", "y"}
@@ -997,6 +1008,7 @@ def main(args=None):
     print(f"EDL Evidence Type: {args.evidence_type}")
     print(f"EDL Loss Type: {args.edl_loss_type}")
     print(f"EDL KL Weight(lambda): {args.edl_kl_weight}")
+    print(f"EDL Annealing Step: {args.annealing_step}")
     print(f"EDL Annealing Start Frac: {args.annealing_start_frac}")
     print(f"Weighted BCE/Data Loss: {args.weighted_bce}")
     print(f"Overlap Policy: {args.overlap_policy}")
@@ -1106,6 +1118,7 @@ def main(args=None):
             total_epochs=args.epochs,
             annealing_start_frac=args.annealing_start_frac,
             annealing_coef=args.annealing_coef,
+            annealing_step=args.annealing_step,
             loss_type=args.edl_loss_type,
             class_weights=class_weights,
         )

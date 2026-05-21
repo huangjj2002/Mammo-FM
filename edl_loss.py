@@ -229,15 +229,17 @@ class EDLLogLossWithAnnealing(torch.nn.Module):
         num_classes: 类别数
         evidence_type: evidence 激活函数类型
         total_epochs: 总训练 epoch 数（用于计算退火比例）
-        annealing_start_frac: 退火开始的 epoch 比例（0~1），在此之前 KL 系数为 0
+        annealing_start_frac: 旧版参数，表示延迟开始 KL 退火的 epoch 比例（0~1）
         annealing_coef: KL 散度的最终权重
+        annealing_step: 标准 EDL 退火步长；若设置，则使用
+            lambda_kl = annealing_coef * min(1, (epoch + 1) / annealing_step)
         loss_type: 'log', 'digamma', 'mse'
         class_weights: 可选类别权重，只作用于 data loss，不作用于 KL
     """
 
     def __init__(self, num_classes=2, evidence_type="softplus",
                  total_epochs=10, annealing_start_frac=0.0,
-                 annealing_coef=1.0, loss_type="log",
+                 annealing_coef=1.0, annealing_step=None, loss_type="log",
                  class_weights=None):
         super().__init__()
         self.num_classes = num_classes
@@ -245,6 +247,7 @@ class EDLLogLossWithAnnealing(torch.nn.Module):
         self.total_epochs = total_epochs
         self.annealing_start_frac = annealing_start_frac
         self.annealing_coef = annealing_coef
+        self.annealing_step = None if annealing_step in (None, "") else float(annealing_step)
         self.loss_type = loss_type
         self.current_epoch = 0
         if class_weights is not None:
@@ -272,15 +275,24 @@ class EDLLogLossWithAnnealing(torch.nn.Module):
         evidence = get_evidence(logits, self.evidence_type)
         alpha = evidence + 1.0
 
-        # 退火系数：在 annealing_start_frac * total_epochs 之后线性增加到 1
-        annealing_start_epoch = self.annealing_start_frac * self.total_epochs
-        if self.current_epoch < annealing_start_epoch:
-            annealing_val = 0.0
-        else:
-            progress = (self.current_epoch - annealing_start_epoch) / max(
-                self.total_epochs - annealing_start_epoch, 1.0
+        # Prefer the standard EDL schedule when annealing_step is provided:
+        # lambda_kl = kl_weight * min(1, (epoch + 1) / annealing_step).
+        if self.annealing_step is not None:
+            annealing_val = min(
+                1.0,
+                (float(self.current_epoch) + 1.0) / max(self.annealing_step, 1.0),
             )
-            annealing_val = min(1.0, progress)
+        else:
+            # Legacy schedule: delay KL until annealing_start_frac * total_epochs,
+            # then linearly increase to 1 by the end of training.
+            annealing_start_epoch = self.annealing_start_frac * self.total_epochs
+            if self.current_epoch < annealing_start_epoch:
+                annealing_val = 0.0
+            else:
+                progress = (self.current_epoch - annealing_start_epoch) / max(
+                    self.total_epochs - annealing_start_epoch, 1.0
+                )
+                annealing_val = min(1.0, progress)
 
         lambda_kl = self.annealing_coef * annealing_val
 

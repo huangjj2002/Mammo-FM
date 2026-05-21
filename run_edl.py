@@ -86,6 +86,8 @@ import sys
 from pathlib import Path
 import argparse
 
+ANNEALING_STEP = EPOCHS
+
 
 def parse_cli_args():
     parser = argparse.ArgumentParser(
@@ -159,6 +161,7 @@ def build_args(gpu_id=None, overlap_policy=None):
         edl_loss_type=EDL_LOSS_TYPE,
         edl_kl_weight=EDL_KL_WEIGHT,
         annealing_coef=ANNEALING_COEF,
+        annealing_step=ANNEALING_STEP,
         annealing_start_frac=ANNEALING_START,
     )
     return args
@@ -179,6 +182,7 @@ if __name__ == "__main__":
     print(f"EDL Evidence Type:    {EVIDENCE_TYPE}")
     print(f"EDL Loss Type:        {EDL_LOSS_TYPE}")
     print(f"EDL KL Weight:        {EDL_KL_WEIGHT}")
+    print(f"EDL Annealing Step:   {ANNEALING_STEP}")
     print(f"EDL Annealing Start:  {ANNEALING_START}")
     print(f"Freeze Backbone:      {FREEZE_BACKBONE}")
     print(f"Weighted BCE/Data:    {WEIGHTED_BCE}")
