@@ -43,6 +43,9 @@ if "--help" in sys.argv or "-h" in sys.argv:
                     help="Legacy output directory. Used only when new output dirs are not set.")
     _p.add_argument("--fold-csv", default=None, type=str,
                     help="Path to save the CSV with fold column")
+    _p.add_argument("--overlap-policy", default="test",
+                    choices=["error", "test", "training"],
+                    help="How to handle patients present in both training and test splits (default: test)")
 
     _p.add_argument("--dataset", default="Custom", type=str, help="Dataset name (default: Custom)")
     _p.add_argument("--data_frac", default="1.0", type=str, help="Fraction of training data (default: 1.0)")
@@ -248,9 +251,23 @@ class EarlyStopping:
 
 # ==================== Fold Creation ====================
 
-def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=None):
+def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=None,
+                 overlap_policy="test"):
     """Create patient-grouped stratified folds from split == training rows."""
     rng = np.random.RandomState(seed)
+    overlap_policy = str(overlap_policy or "test").strip().lower()
+    overlap_aliases = {
+        "raise": "error",
+        "strict": "error",
+        "train": "training",
+    }
+    overlap_policy = overlap_aliases.get(overlap_policy, overlap_policy)
+    allowed_overlap_policies = {"error", "test", "training"}
+    if overlap_policy not in allowed_overlap_policies:
+        raise ValueError(
+            f"Unsupported overlap_policy={overlap_policy!r}. "
+            f"Expected one of {sorted(allowed_overlap_policies)}."
+        )
 
     df = read_mammo_csv(csv_path)
     required_cols = {"split", "patient_id", "image_id", label_col}
@@ -279,18 +296,30 @@ def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=N
     df["fold"] = -1
     train_mask = df["split"] == "training"
     test_mask = df["split"] == "test"
-    train_df = df[train_mask].copy()
-    if train_df.empty:
-        raise ValueError("No rows with split == 'training'; cannot create CV folds.")
 
     train_patients = set(df.loc[train_mask, "patient_id"])
     test_patients = set(df.loc[test_mask, "patient_id"])
     overlap = sorted(train_patients & test_patients)
     if overlap:
-        raise ValueError(
+        message = (
             f"{len(overlap)} patient(s) appear in both training and test split. "
             f"Examples: {overlap[:5]}"
         )
+        if overlap_policy == "error":
+            raise ValueError(message)
+        overlap_mask = df["patient_id"].isin(overlap)
+        overlap_split_counts = df.loc[overlap_mask, "split"].value_counts().to_dict()
+        print(f"[Folds] WARNING: {message}")
+        print(f"[Folds] Overlap row split counts before fix: {overlap_split_counts}")
+        print(f"[Folds] Resolving overlap by assigning all overlap patients to split={overlap_policy!r}.")
+        df.loc[overlap_mask, "split"] = overlap_policy
+        train_mask = df["split"] == "training"
+        test_mask = df["split"] == "test"
+        print(f"[Folds] split counts after overlap fix:\n{df['split'].value_counts()}")
+
+    train_df = df[train_mask].copy()
+    if train_df.empty:
+        raise ValueError("No rows with split == 'training'; cannot create CV folds.")
 
     patient_info = train_df.groupby("patient_id").agg(
         label=(label_col, "max"),
@@ -828,6 +857,8 @@ def main(args=None):
         parser.add_argument("--csv-output-dir", default=None, type=str)
         parser.add_argument("--output-dir", default=None, type=str)
         parser.add_argument("--fold-csv", default=None, type=str)
+        parser.add_argument("--overlap-policy", default="test",
+                            choices=["error", "test", "training"])
 
         # 数据参数
         parser.add_argument("--dataset", default="Custom", type=str)
@@ -896,6 +927,15 @@ def main(args=None):
     if not hasattr(args, "weighted_BCE"):
         args.weighted_BCE = getattr(args, "weighted_bce", "y")
     args.weighted_bce = str(args.weighted_BCE).lower() in {"1", "true", "t", "yes", "y"}
+    overlap_policy = str(getattr(args, "overlap_policy", "test")).strip().lower()
+    overlap_policy = {"raise": "error", "strict": "error", "train": "training"}.get(
+        overlap_policy, overlap_policy
+    )
+    if overlap_policy not in {"error", "test", "training"}:
+        raise ValueError(
+            f"Unsupported overlap_policy={overlap_policy!r}. Expected error, test, or training."
+        )
+    args.overlap_policy = overlap_policy
 
     # ---- GPU 设置 ----
     gpu_id = int(getattr(args, "gpu_id", 0))
@@ -959,6 +999,7 @@ def main(args=None):
     print(f"EDL KL Weight(lambda): {args.edl_kl_weight}")
     print(f"EDL Annealing Start Frac: {args.annealing_start_frac}")
     print(f"Weighted BCE/Data Loss: {args.weighted_bce}")
+    print(f"Overlap Policy: {args.overlap_policy}")
     print(f"Num Classes: {args.num_classes}")
     print("=" * 60)
 
@@ -971,7 +1012,8 @@ def main(args=None):
         fold_csv_path = csv_output_dir / f"{Path(args.data_csv).stem}_folds.csv"
     folds_csv = create_folds(args.data_csv, label_col=args.label,
                              n_folds=args.n_folds, seed=args.seed,
-                             output_path=fold_csv_path)
+                             output_path=fold_csv_path,
+                             overlap_policy=args.overlap_policy)
     df = read_mammo_csv(folds_csv)
 
     # ---- 加载基础 checkpoint ----

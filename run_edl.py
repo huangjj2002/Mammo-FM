@@ -30,6 +30,8 @@ OUTPUT_DIR       = CSV_OUTPUT_DIR               # 兼容旧参数
 FOLD_CSV         = None                          # None = 自动生成
 
 # ---- 数据 ----
+OVERLAP_POLICY   = "test"  # error/test/training for patient split overlap
+
 DATASET          = "Custom"
 DATA_FRAC        = "1.0"
 LABEL            = "cancer"
@@ -53,7 +55,7 @@ IMG_SIZE         = [1520, 912]  # 图片尺寸 [高, 宽]
 
 # ---- 设备 ----
 DEVICE           = "cuda"
-GPU_ID           = 1
+GPU_ID           = 2
 APEX             = "y"
 PRINT_FREQ       = 50
 LOG_FREQ         = 200
@@ -95,12 +97,19 @@ def parse_cli_args():
         type=int,
         help=f"GPU device ID to use for training (default: {GPU_ID})",
     )
+    parser.add_argument(
+        "--overlap-policy",
+        default=OVERLAP_POLICY,
+        choices=["error", "test", "training"],
+        help="How to handle patients present in both training and test splits.",
+    )
     return parser.parse_args()
 
 
-def build_args(gpu_id=None):
+def build_args(gpu_id=None, overlap_policy=None):
     """构建参数 Namespace"""
     resolved_gpu_id = GPU_ID if gpu_id is None else int(gpu_id)
+    resolved_overlap_policy = OVERLAP_POLICY if overlap_policy is None else overlap_policy
     args = argparse.Namespace(
         # 路径
         data_dir=DATA_DIR,
@@ -111,6 +120,7 @@ def build_args(gpu_id=None):
         csv_output_dir=CSV_OUTPUT_DIR,
         output_dir=OUTPUT_DIR,
         fold_csv=FOLD_CSV,
+        overlap_policy=resolved_overlap_policy,
         # 数据
         dataset=DATASET,
         data_frac=DATA_FRAC,
@@ -161,7 +171,7 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent))
     from finetune_edl import main as _main
 
-    args = build_args(gpu_id=cli_args.gpu_id)
+    args = build_args(gpu_id=cli_args.gpu_id, overlap_policy=cli_args.overlap_policy)
     print("=" * 60)
     print("  Evidential Deep Learning (EDL) Fine-tuning")
     print("=" * 60)
@@ -172,6 +182,7 @@ if __name__ == "__main__":
     print(f"EDL Annealing Start:  {ANNEALING_START}")
     print(f"Freeze Backbone:      {FREEZE_BACKBONE}")
     print(f"Weighted BCE/Data:    {WEIGHTED_BCE}")
+    print(f"Overlap Policy:       {cli_args.overlap_policy}")
     print(f"Model Save Dir:       {MODEL_SAVE_DIR}")
     print(f"CSV Output Dir:       {CSV_OUTPUT_DIR}")
     print("=" * 60)
