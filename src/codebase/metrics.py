@@ -2,7 +2,7 @@ import numpy as np
 
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, roc_curve, precision_recall_curve, auc,
-    f1_score, roc_auc_score, average_precision_score,
+    f1_score, roc_auc_score, average_precision_score, balanced_accuracy_score,
     confusion_matrix, classification_report
 )
 
@@ -42,6 +42,18 @@ def compute_auprc(gt, pred):
 
 def compute_accuracy_np_array(gt, pred):
     return np.mean(gt == pred)
+
+
+def compute_bacc_at_threshold(gt, pred, threshold=0.5):
+    gt = np.asarray(gt).astype(int)
+    pred = np.asarray(pred)
+    pred_label = (pred >= threshold).astype(int)
+    n_unique = len(np.unique(gt))
+    if n_unique < 2:
+        print(f"[compute_bacc_at_threshold] WARNING: gt has only {n_unique} unique class(es). "
+              f"bACC set to 0.5.")
+        return 0.5
+    return balanced_accuracy_score(gt, pred_label)
 
 
 def pr_auc(gt, pred, get_all=False):
@@ -182,6 +194,7 @@ def all_classification_metrics(gt, pred, target_fpr=0.15):
     pred_label_max_f1 = (pred >= threshold_max_f1).astype(int)
     pred_label_target_precision = (pred >= threshold_target_precision).astype(int)
     pred_label_target_recall = (pred >= threshold_target_recall).astype(int)
+    bacc_05 = compute_bacc_at_threshold(gt, pred, threshold=0.5)
 
     # Safe AUROC/AUPRC computation — single-class edge case returns 0.5
     n_unique = len(np.unique(gt))
@@ -238,6 +251,7 @@ def all_classification_metrics(gt, pred, target_fpr=0.15):
 
         "AUROC": auroc_val,
         "AUPRC": auprc_val,
+        "bACC": bacc_05,
     }
 
     return metrics

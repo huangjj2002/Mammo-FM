@@ -14,6 +14,11 @@ CSV_FILE         = "embed_data_testcohort_enriched.csv"    # CSV文件
 CLIP_CHK_PT_PATH = r"./model/Mammo-FM_BatmanlabTrained_CLIP.tar"
 OUTPUT_DIR       = r"./output/finetune_cancer"
 FOLD_CSV         = None                         
+OVERLAP_POLICY   = "test"  # error/test/train for patient split overlap
+SPLIT_BY_COHORT  = "y"
+COHORT_COL       = "cohort_num"
+TRAIN_COHORTS    = "1-8"
+TEST_COHORTS     = "9-10"
 
 
 DATASET          = "Custom"                      
@@ -74,6 +79,11 @@ def build_args():
         clip_chk_pt_path=CLIP_CHK_PT_PATH,
         output_dir=OUTPUT_DIR,
         fold_csv=FOLD_CSV,
+        overlap_policy=OVERLAP_POLICY,
+        split_by_cohort=SPLIT_BY_COHORT,
+        cohort_col=COHORT_COL,
+        train_cohorts=TRAIN_COHORTS,
+        test_cohorts=TEST_COHORTS,
         dataset=DATASET,
         data_frac=DATA_FRAC,
         label=LABEL,
@@ -106,4 +116,13 @@ def build_args():
 
 if __name__ == "__main__":
     args = build_args()
+    print("=" * 60)
+    print("  Mammo-FM Fine-tuning")
+    print("=" * 60)
+    print(f"Selected GPU ID:      {GPU_ID}")
+    print(f"Folds:                {N_FOLDS}")
+    print(f"Split By Cohort:      {SPLIT_BY_COHORT}")
+    print(f"Train/Test Cohorts:   {TRAIN_COHORTS} / {TEST_COHORTS} ({COHORT_COL})")
+    print(f"Overlap Policy:       {OVERLAP_POLICY}")
+    print("=" * 60)
     _main(args)

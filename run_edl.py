@@ -17,11 +17,11 @@ EDL (Evidential Deep Learning) 微调启动脚本
 # =============================================================================
 
 # ---- 路径 ----
-DATA_DIR         = r"/opt/localdata/Data/dh/dh_preprocessed/hjj_images"                   # 数据根目录
+DATA_DIR         = r"/home/dhao4/workspace/hjj_workspace/data"                   # 数据根目录
 IMG_DIR          = "images_png"                  # 图片目录
-CSV_FILE         = "embed_data_testcohort_enriched.csv"    # CSV文件
-# DATA_DIR         = r"G:\data"                   # 数据根目录
-# IMG_DIR          = r"images_png"                  # 图片目录
+CSV_FILE         = "/home/dhao4/workspace/hjj_workspace/data/data.csv"    # CSV文件
+#DATA_DIR         = r"G:\data"                   # 数据根目录
+#IMG_DIR          = r"images_png"                  # 图片目录
 #CSV_FILE         = r"train_with_test_data_mini.csv"    # CSV文件
 CLIP_CHK_PT_PATH = r"./model/Mammo-FM_BatmanlabTrained_CLIP.tar"
 MODEL_SAVE_DIR   = r"./best_model"              # 最佳模型保存目录
@@ -30,7 +30,11 @@ OUTPUT_DIR       = CSV_OUTPUT_DIR               # 兼容旧参数
 FOLD_CSV         = None                          # None = 自动生成
 
 # ---- 数据 ----
-OVERLAP_POLICY   = "test"  # error/test/training for patient split overlap
+OVERLAP_POLICY   = "test"  # error/test/train for patient split overlap
+SPLIT_BY_COHORT  = "y"     # y = use cohort_num to create train/test split
+COHORT_COL       = "cohort_num"
+TRAIN_COHORTS    = "1-8"
+TEST_COHORTS     = "9-10"
 
 DATASET          = "Custom"
 DATA_FRAC        = "1.0"
@@ -39,8 +43,8 @@ ARCH             = "breast_clip_det_b5_period_n_ft"  # 全量微调
 FREEZE_BACKBONE  = "y"   # "y" = freeze Mammo-FM backbone and train only EDL head; "n" = full fine-tuning
 
 # ---- 训练 ----
-N_FOLDS          = 5       # 交叉验证折数
-EPOCHS           = 10      # 每折最大训练轮数
+N_FOLDS          = 0       # 交叉验证折数
+EPOCHS           = 25      # 每折最大训练轮数
 EARLY_STOP       = 3       # 早停参数（0=禁用）
 BATCH_SIZE       = 8      # 批大小
 LR               = 5e-5    # 学习率
@@ -55,7 +59,7 @@ IMG_SIZE         = [1520, 912]  # 图片尺寸 [高, 宽]
 
 # ---- 设备 ----
 DEVICE           = "cuda"
-GPU_ID           = 2
+GPU_ID           = 4
 APEX             = "y"
 PRINT_FREQ       = 50
 LOG_FREQ         = 200
@@ -102,7 +106,7 @@ def parse_cli_args():
     parser.add_argument(
         "--overlap-policy",
         default=OVERLAP_POLICY,
-        choices=["error", "test", "training"],
+        choices=["error", "test", "train", "training"],
         help="How to handle patients present in both training and test splits.",
     )
     return parser.parse_args()
@@ -123,6 +127,10 @@ def build_args(gpu_id=None, overlap_policy=None):
         output_dir=OUTPUT_DIR,
         fold_csv=FOLD_CSV,
         overlap_policy=resolved_overlap_policy,
+        split_by_cohort=SPLIT_BY_COHORT,
+        cohort_col=COHORT_COL,
+        train_cohorts=TRAIN_COHORTS,
+        test_cohorts=TEST_COHORTS,
         # 数据
         dataset=DATASET,
         data_frac=DATA_FRAC,
@@ -187,6 +195,8 @@ if __name__ == "__main__":
     print(f"Freeze Backbone:      {FREEZE_BACKBONE}")
     print(f"Weighted BCE/Data:    {WEIGHTED_BCE}")
     print(f"Overlap Policy:       {cli_args.overlap_policy}")
+    print(f"Split By Cohort:      {SPLIT_BY_COHORT}")
+    print(f"Train/Test Cohorts:   {TRAIN_COHORTS} / {TEST_COHORTS} ({COHORT_COL})")
     print(f"Model Save Dir:       {MODEL_SAVE_DIR}")
     print(f"CSV Output Dir:       {CSV_OUTPUT_DIR}")
     print("=" * 60)

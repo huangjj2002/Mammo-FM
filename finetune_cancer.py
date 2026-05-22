@@ -22,6 +22,16 @@ if "--help" in sys.argv or "-h" in sys.argv:
                     type=str, help="Directory for checkpoints, logs, and predictions")
     _p.add_argument("--fold-csv", default=None, type=str,
                     help="Path to save the CSV with fold column. Default: next to --csv-file as *_folds.csv")
+    _p.add_argument("--overlap-policy", default="test", choices=["error", "test", "train", "training"],
+                    help="How to handle patients present in both train and test splits (default: test)")
+    _p.add_argument("--split-by-cohort", default="y", type=str,
+                    help="Use cohort column to create train/test split (default: y)")
+    _p.add_argument("--cohort-col", default="cohort_num", type=str,
+                    help="Cohort column name (default: cohort_num)")
+    _p.add_argument("--train-cohorts", default="1-8", type=str,
+                    help="Comma/range cohort spec for training pool (default: 1-8)")
+    _p.add_argument("--test-cohorts", default="9-10", type=str,
+                    help="Comma/range cohort spec for test set (default: 9-10)")
  
     _p.add_argument("--dataset", default="Custom", type=str, help="Dataset name, for logging only (default: Custom)")
     _p.add_argument("--data_frac", default="1.0", type=str, help="Fraction of training data to use (default: 1.0)")
@@ -30,7 +40,7 @@ if "--help" in sys.argv or "-h" in sys.argv:
                     choices=["breast_clip_det_b5_period_n_lp", "breast_clip_det_b5_period_n_ft"],
                     help="lp=linear probe (frozen backbone), ft=full fine-tuning (default: breast_clip_det_b5_period_n_ft)")
 
-    _p.add_argument("--n_folds", default=5, type=int, help="Number of CV folds (default: 5)")
+    _p.add_argument("--n_folds", default=5, type=int, help="Number of CV folds. 0 disables CV (default: 5)")
     _p.add_argument("--epochs", default=10, type=int, help="Max epochs per fold (default: 10)")
     _p.add_argument("--early-stop", default=5, type=int, help="Early stopping patience, 0=disabled (default: 5)")
     _p.add_argument("--batch-size", default=4, type=int, help="Batch size (default: 4)")
@@ -63,6 +73,7 @@ if "--help" in sys.argv or "-h" in sys.argv:
 
 import argparse
 import gc
+import math
 import os
 import time
 import warnings
@@ -183,7 +194,81 @@ class EarlyStopping:
 
 
 
-def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=None):
+CSV_DTYPES = {
+    "patient_id": str,
+    "image_id": str,
+    "split": str,
+}
+
+
+def read_mammo_csv(csv_path):
+    return pd.read_csv(csv_path, dtype=CSV_DTYPES)
+
+
+def parse_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Cannot parse boolean value: {value!r}")
+
+
+def parse_cohort_spec(value):
+    if isinstance(value, (list, tuple, set)):
+        tokens = []
+        for item in value:
+            tokens.extend(str(item).split(","))
+    else:
+        tokens = str(value).split(",")
+
+    cohorts = set()
+    for raw_token in tokens:
+        token = raw_token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_text, end_text = token.split("-", 1)
+            start = int(start_text.strip())
+            end = int(end_text.strip())
+            if end < start:
+                raise ValueError(f"Invalid cohort range {token!r}: end < start.")
+            cohorts.update(range(start, end + 1))
+        else:
+            cohorts.add(int(token))
+    if not cohorts:
+        raise ValueError(f"Cohort spec {value!r} did not contain any cohort numbers.")
+    return cohorts
+
+
+def resolve_cohort_column(df, cohort_col):
+    if cohort_col in df.columns:
+        return cohort_col
+    for candidate in ("cohort_num", "cohert_num"):
+        if candidate in df.columns:
+            print(f"[Split] WARNING: cohort column {cohort_col!r} not found. Using {candidate!r}.")
+            return candidate
+    raise ValueError(f"CSV is missing cohort column {cohort_col!r}.")
+
+
+def normalize_split_values(split_series):
+    aliases = {
+        "train": "train",
+        "training": "train",
+        "test": "test",
+    }
+    normalized = split_series.astype(str).str.strip().str.lower().map(aliases)
+    if normalized.isna().any():
+        bad = sorted(set(split_series[normalized.isna()].astype(str).str.strip()))
+        raise ValueError(f"Unsupported split value(s): {bad}. Expected train/training or test.")
+    return normalized
+
+
+def create_folds_legacy(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=None):
 
     rng = np.random.RandomState(seed)
 
@@ -305,6 +390,193 @@ def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=N
     return output_path
 
 
+def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=None,
+                 overlap_policy="test", split_by_cohort=False, cohort_col="cohort_num",
+                 train_cohorts="1-8", test_cohorts="9-10"):
+    rng = np.random.RandomState(seed)
+    overlap_policy = str(overlap_policy or "test").strip().lower()
+    overlap_policy = {
+        "raise": "error",
+        "strict": "error",
+        "training": "train",
+    }.get(overlap_policy, overlap_policy)
+    if overlap_policy not in {"error", "test", "train"}:
+        raise ValueError(f"Unsupported overlap_policy={overlap_policy!r}. Expected error, test, or train.")
+
+    df = read_mammo_csv(csv_path)
+    split_by_cohort = parse_bool(split_by_cohort, default=False)
+    required_cols = {"patient_id", "image_id", label_col}
+    if not split_by_cohort:
+        required_cols.add("split")
+    missing_cols = required_cols - set(df.columns)
+    if missing_cols:
+        raise ValueError(f"CSV is missing required column(s): {sorted(missing_cols)}")
+    if n_folds < 0 or n_folds == 1:
+        raise ValueError(f"n_folds must be 0 or >= 2, got {n_folds}")
+
+    df["patient_id"] = df["patient_id"].astype(str)
+    df["image_id"] = df["image_id"].astype(str)
+    df[label_col] = pd.to_numeric(df[label_col], errors="raise").astype(int)
+    if split_by_cohort:
+        resolved_cohort_col = resolve_cohort_column(df, cohort_col)
+        df[resolved_cohort_col] = pd.to_numeric(df[resolved_cohort_col], errors="raise").astype(int)
+        train_cohort_set = parse_cohort_spec(train_cohorts)
+        test_cohort_set = parse_cohort_spec(test_cohorts)
+        overlap_cohorts = sorted(train_cohort_set & test_cohort_set)
+        if overlap_cohorts:
+            raise ValueError(f"Train/test cohort specs overlap: {overlap_cohorts}")
+        df["split"] = ""
+        df.loc[df[resolved_cohort_col].isin(train_cohort_set), "split"] = "train"
+        df.loc[df[resolved_cohort_col].isin(test_cohort_set), "split"] = "test"
+        unmapped = df["split"] == ""
+        if unmapped.any():
+            bad_cohorts = sorted(df.loc[unmapped, resolved_cohort_col].dropna().unique().tolist())
+            raise ValueError(
+                f"{int(unmapped.sum())} row(s) have cohort values outside train/test specs: {bad_cohorts}"
+            )
+        print(f"[Split] Using cohort split from column {resolved_cohort_col!r}: "
+              f"train={sorted(train_cohort_set)}, test={sorted(test_cohort_set)}")
+    else:
+        df["split"] = normalize_split_values(df["split"])
+
+    bad_labels = sorted(set(df[label_col].dropna().unique()) - {0, 1})
+    if bad_labels:
+        raise ValueError(f"Unsupported label value(s) in {label_col}: {bad_labels}. Expected 0/1.")
+    print(f"[Folds] Loaded {len(df)} rows. split counts:\n{df['split'].value_counts()}")
+
+    df["fold"] = -1
+    train_mask = df["split"] == "train"
+    test_mask = df["split"] == "test"
+
+    train_patients = set(df.loc[train_mask, "patient_id"])
+    test_patients = set(df.loc[test_mask, "patient_id"])
+    overlap = sorted(train_patients & test_patients)
+    if overlap:
+        message = (
+            f"{len(overlap)} patient(s) appear in both train and test split. "
+            f"Examples: {overlap[:5]}"
+        )
+        if overlap_policy == "error":
+            raise ValueError(message)
+        overlap_mask = df["patient_id"].isin(overlap)
+        overlap_split_counts = df.loc[overlap_mask, "split"].value_counts().to_dict()
+        print(f"[Folds] WARNING: {message}")
+        print(f"[Folds] Overlap row split counts before fix: {overlap_split_counts}")
+        print(f"[Folds] Resolving overlap by assigning all overlap patients to split={overlap_policy!r}.")
+        df.loc[overlap_mask, "split"] = overlap_policy
+        train_mask = df["split"] == "train"
+        test_mask = df["split"] == "test"
+        print(f"[Folds] split counts after overlap fix:\n{df['split'].value_counts()}")
+
+    train_df = df[train_mask].copy()
+    if train_df.empty:
+        raise ValueError("No rows with split == 'train'; cannot create folds.")
+
+    if n_folds == 0:
+        df.loc[train_mask, "fold"] = 0
+        csv_path = Path(csv_path)
+        if output_path is None:
+            output_path = csv_path.parent / f"{csv_path.stem}_folds{csv_path.suffix}"
+        else:
+            output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(output_path, index=False)
+        print(f"[Folds] Saved single-run split CSV -> {output_path}")
+        print(f"  Train (fold=0): {int(train_mask.sum())} images, "
+              f"{df.loc[train_mask, 'patient_id'].nunique()} patients")
+        print(f"  Test (fold=-1): {int(test_mask.sum())} images, "
+              f"{df.loc[test_mask, 'patient_id'].nunique()} patients")
+        return output_path
+
+    patient_info = train_df.groupby("patient_id").agg(
+        label=(label_col, "max"),
+        n_images=("image_id", "count"),
+    ).reset_index()
+    patient_info["label"] = patient_info["label"].astype(int)
+
+    pos_patients = patient_info[patient_info["label"] == 1]["patient_id"].values
+    neg_patients = patient_info[patient_info["label"] == 0]["patient_id"].values
+    if len(patient_info) < n_folds:
+        raise ValueError(
+            f"n_folds={n_folds} is larger than the number of training patients "
+            f"({len(patient_info)}). Reduce n_folds."
+        )
+    print(f"[Folds] Training patients: {len(patient_info)} "
+          f"(pos={len(pos_patients)}, neg={len(neg_patients)})")
+    print(f"[Folds] Training images:   {len(train_df)} "
+          f"(pos={(train_df[label_col] == 1).sum()}, neg={(train_df[label_col] == 0).sum()})")
+
+    use_manual = len(pos_patients) < n_folds
+    if use_manual:
+        print(f"[Folds] WARNING: Only {len(pos_patients)} positive patient(s) for {n_folds} folds. "
+              f"Some folds would have 0 cancer cases. Falling back to manual stratified split.")
+
+    if use_manual:
+        rng.shuffle(pos_patients)
+        rng.shuffle(neg_patients)
+        pos_folds = np.array_split(pos_patients, n_folds)
+        neg_folds = np.array_split(neg_patients, n_folds)
+        for fold_id in range(n_folds):
+            fold_patients = np.concatenate([pos_folds[fold_id], neg_folds[fold_id]])
+            fold_mask = train_df["patient_id"].isin(fold_patients)
+            df.loc[train_df[fold_mask].index, "fold"] = fold_id
+    else:
+        patient_ids = patient_info["patient_id"].values
+        y_patient = patient_info["label"].values.astype(int)
+        try:
+            sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+            for fold_id, (_, val_patient_pos) in enumerate(
+                sgkf.split(patient_ids, y_patient, groups=patient_ids)
+            ):
+                val_patients = set(patient_ids[val_patient_pos])
+                val_mask = train_df["patient_id"].isin(val_patients)
+                df.loc[train_df[val_mask].index, "fold"] = fold_id
+        except ValueError as e:
+            print(f"[Folds] StratifiedGroupKFold failed ({e}). Falling back to manual split.")
+            rng.shuffle(pos_patients)
+            rng.shuffle(neg_patients)
+            pos_folds = np.array_split(pos_patients, n_folds)
+            neg_folds = np.array_split(neg_patients, n_folds)
+            for fold_id in range(n_folds):
+                fold_patients = np.concatenate([pos_folds[fold_id], neg_folds[fold_id]])
+                fold_mask = train_df["patient_id"].isin(fold_patients)
+                df.loc[train_df[fold_mask].index, "fold"] = fold_id
+
+    fold_ok = True
+    for f in range(n_folds):
+        f_pos_patients = df[(df["fold"] == f) & (df[label_col] == 1)]["patient_id"].nunique()
+        f_neg_patients = df[(df["fold"] == f) & (df[label_col] == 0)]["patient_id"].nunique()
+        if f_pos_patients == 0:
+            print(f"[Folds] ERROR: Fold {f} has ZERO positive patients! "
+                  f"Consider reducing --n_folds. Got {len(pos_patients)} pos patients total.")
+            fold_ok = False
+        if f_neg_patients == 0:
+            print(f"[Folds] ERROR: Fold {f} has ZERO negative patients! "
+                  f"Consider reducing --n_folds. Got {len(neg_patients)} neg patients total.")
+            fold_ok = False
+    if not fold_ok:
+        print("[Folds] FOLD BALANCE CHECK WARNING. Continuing because patient-level grouping is prioritized.")
+
+    csv_path = Path(csv_path)
+    if output_path is None:
+        output_path = csv_path.parent / f"{csv_path.stem}_folds{csv_path.suffix}"
+    else:
+        output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    df.to_csv(output_path, index=False)
+    print(f"[Folds] Saved {n_folds}-fold (patient-grouped) CSV -> {output_path}")
+    for f in range(n_folds):
+        fold_count = (df["fold"] == f).sum()
+        pos_count = ((df["fold"] == f) & (df[label_col] == 1)).sum()
+        patient_count = df[df["fold"] == f]["patient_id"].nunique()
+        pos_patient_count = df[(df["fold"] == f) & (df[label_col] == 1)]["patient_id"].nunique()
+        print(f"  Fold {f}: {fold_count} images, {patient_count} patients "
+              f"(pos_patients={pos_patient_count}), cancer_images={pos_count} "
+              f"({pos_count / max(fold_count, 1) * 100:.1f}%)")
+    print(f"  Test (fold=-1): {(df['fold'] == -1).sum()} images, "
+          f"{df[df['fold'] == -1]['patient_id'].nunique()} patients")
+    return output_path
 
 
 def train_epoch(model, loader, criterion, optimizer, scheduler, scaler, epoch, total_epochs, args, logger, device):
@@ -451,6 +723,77 @@ def predict_all(model_paths, df_all, img_dir, args, device, threshold=None):
 
 
 
+def save_loss_curve(history_df, output_path, title):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(history_df["epoch"], history_df["train_loss"], marker="o", linewidth=2, label="train_loss")
+    ax.plot(history_df["epoch"], history_df["val_loss"], marker="s", linewidth=2, label="val_loss")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title(title)
+    ax.grid(True, linestyle="--", alpha=0.35)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_all_folds_loss_curve(history_df, output_path, title):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    folds = sorted(history_df["fold"].unique().tolist())
+    if not folds:
+        return
+    ncols = 2 if len(folds) > 1 else 1
+    nrows = math.ceil(len(folds) / ncols)
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(8 * ncols, 4.5 * nrows), squeeze=False)
+    axes_flat = axes.flatten()
+    for ax, fold in zip(axes_flat, folds):
+        fold_df = history_df[history_df["fold"] == fold].sort_values("epoch")
+        ax.plot(fold_df["epoch"], fold_df["train_loss"], marker="o", linewidth=2, label="train_loss")
+        ax.plot(fold_df["epoch"], fold_df["val_loss"], marker="s", linewidth=2, label="val_loss")
+        ax.set_title(f"Fold {fold}")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.grid(True, linestyle="--", alpha=0.35)
+        ax.legend()
+    for ax in axes_flat[len(folds):]:
+        ax.axis("off")
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_fold_split_csv(df, output_path, fold, n_folds):
+    df_out = df.copy()
+    if n_folds > 0:
+        train_pool_mask = df_out["split"] == "train"
+        df_out.loc[train_pool_mask & (df_out["fold"] == fold), "split"] = "val"
+        df_out.loc[train_pool_mask & (df_out["fold"] != fold), "split"] = "train"
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df_out.to_csv(output_path, index=False)
+    print(f"[Split] Fold {fold} split CSV saved -> {output_path}")
+    return output_path
+
+
+def save_metrics_csv(metrics, output_path, split_name):
+    rows = []
+    for metric, value in metrics.items():
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            rows.append({"split": split_name, "metric": metric, "value": float(value)})
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(output_path, index=False)
+    print(f"[Final] Metrics saved -> {output_path}")
+
+
 def main(args=None):
 
     if args is None:
@@ -488,6 +831,16 @@ def main(args=None):
                             type=str,
                             help="Path to save the CSV with fold column. "
                                  "Default: next to --csv-file as *_folds.csv")
+        parser.add_argument("--overlap-policy", default="test", choices=["error", "test", "train", "training"],
+                            help="How to handle patients present in both train and test splits (default: test)")
+        parser.add_argument("--split-by-cohort", default="y", type=str,
+                            help="Use cohort column to create train/test split (default: y)")
+        parser.add_argument("--cohort-col", default="cohort_num", type=str,
+                            help="Cohort column name (default: cohort_num)")
+        parser.add_argument("--train-cohorts", default="1-8", type=str,
+                            help="Comma/range cohort spec for training pool (default: 1-8)")
+        parser.add_argument("--test-cohorts", default="9-10", type=str,
+                            help="Comma/range cohort spec for test set (default: 9-10)")
 
 
         parser.add_argument("--dataset",
@@ -510,7 +863,7 @@ def main(args=None):
 
 
         parser.add_argument("--n_folds", default=5, type=int,
-                            help="Number of CV folds (default: 5)")
+                            help="Number of CV folds. 0 disables CV (default: 5)")
         parser.add_argument("--epochs", default=10, type=int,
                             help="Max epochs per fold (default: 10)")
         parser.add_argument("--early-stop", default=5, type=int,
@@ -583,6 +936,20 @@ def main(args=None):
     args.apex = str(args.apex).lower() == "y"
     args.weighted_bce = str(args.weighted_BCE).lower() == "y"
     args.data_frac = float(args.data_frac)
+    args.n_folds = int(args.n_folds)
+    if args.n_folds < 0 or args.n_folds == 1:
+        raise ValueError(f"n_folds must be 0 or >= 2, got {args.n_folds}")
+    args.split_by_cohort = parse_bool(getattr(args, "split_by_cohort", True), default=True)
+    args.cohort_col = str(getattr(args, "cohort_col", "cohort_num"))
+    args.train_cohorts = str(getattr(args, "train_cohorts", "1-8"))
+    args.test_cohorts = str(getattr(args, "test_cohorts", "9-10"))
+    overlap_policy = str(getattr(args, "overlap_policy", "test")).strip().lower()
+    overlap_policy = {"raise": "error", "strict": "error", "training": "train"}.get(
+        overlap_policy, overlap_policy
+    )
+    if overlap_policy not in {"error", "test", "train"}:
+        raise ValueError(f"Unsupported overlap_policy={overlap_policy!r}. Expected error, test, or train.")
+    args.overlap_policy = overlap_policy
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     seed_all(args.seed)
 
@@ -602,13 +969,22 @@ def main(args=None):
     print(f"Epochs(max): {args.epochs}  |  Batch: {args.batch_size}  |  LR: {args.lr}")
     print(f"Dataset: {args.dataset}  |  Label: {args.label}  |  Data frac: {args.data_frac}")
     print(f"Weighted BCE: {args.weighted_bce}  |  AMP: {args.apex}")
+    print(f"Overlap Policy: {args.overlap_policy}")
+    print(f"Split By Cohort: {args.split_by_cohort}")
+    if args.split_by_cohort:
+        print(f"Cohort Column: {args.cohort_col}  |  Train: {args.train_cohorts}  |  Test: {args.test_cohorts}")
     print("=" * 60)
 
 
     folds_csv = create_folds(args.data_csv, label_col=args.label,
                              n_folds=args.n_folds, seed=args.seed,
-                             output_path=args.fold_csv)
-    df = pd.read_csv(folds_csv)
+                             output_path=args.fold_csv,
+                             overlap_policy=args.overlap_policy,
+                             split_by_cohort=args.split_by_cohort,
+                             cohort_col=args.cohort_col,
+                             train_cohorts=args.train_cohorts,
+                             test_cohorts=args.test_cohorts)
+    df = read_mammo_csv(folds_csv)
 
 
     base_ckpt = torch.load(args.clip_chk_pt_path, map_location="cpu", weights_only=False)
@@ -619,30 +995,41 @@ def main(args=None):
 
     fold_model_paths = []   
     oof_parts = []          
+    all_fold_histories = []
+    data_stem = Path(args.data_csv).stem
+    fold_ids = [0] if args.n_folds == 0 else list(range(args.n_folds))
 
-    for fold in range(args.n_folds):
+    for fold in fold_ids:
+        total_runs = 1 if args.n_folds == 0 else args.n_folds
+        eval_split_name = "test" if args.n_folds == 0 else "val"
         print(f"\n{'=' * 60}")
-        print(f"  Fold {fold} / {args.n_folds}")
+        print(f"  Fold {fold} / {total_runs}  |  epoch eval split: {eval_split_name}")
         print(f"{'=' * 60}")
 
         seed_all(args.seed)  
 
 
-        train_df = df[(df["fold"] != -1) & (df["fold"] != fold)].reset_index(drop=True)
-        valid_df = df[df["fold"] == fold].reset_index(drop=True)
+        train_pool_mask = df["split"] == "train"
+        if args.n_folds == 0:
+            train_df = df[train_pool_mask].reset_index(drop=True)
+            valid_df = df[df["split"] == "test"].reset_index(drop=True)
+        else:
+            train_df = df[train_pool_mask & (df["fold"] != fold)].reset_index(drop=True)
+            valid_df = df[train_pool_mask & (df["fold"] == fold)].reset_index(drop=True)
+        save_fold_split_csv(df, output_dir / f"{data_stem}_fold{fold}_splits.csv", fold, args.n_folds)
 
    
         if args.data_frac < 1.0:
             train_df = train_df.sample(frac=args.data_frac, random_state=args.seed).reset_index(drop=True)
 
-        print(f"Train: {len(train_df)}  |  Valid: {len(valid_df)}")
+        print(f"Train: {len(train_df)}  |  {eval_split_name.title()}: {len(valid_df)}")
         print(f"  Train cancer%: {train_df[args.label].mean()*100:.1f}%")
-        print(f"  Valid cancer%: {valid_df[args.label].mean()*100:.1f}%")
+        print(f"  {eval_split_name.title()} cancer%: {valid_df[args.label].mean()*100:.1f}%")
 
     
         n_valid_classes = valid_df[args.label].nunique()
         if n_valid_classes < 2:
-            print(f"  WARNING: Valid set for fold {fold} has only {n_valid_classes} class(es). "
+            print(f"  WARNING: {eval_split_name.title()} set for fold {fold} has only {n_valid_classes} class(es). "
                   f"AUROC will be 0.5 (not meaningful). Consider reducing n_folds or using more data.")
 
         train_transform = get_train_transform(tuple(args.img_size), args.alpha, args.sigma, args.p)
@@ -701,6 +1088,7 @@ def main(args=None):
         last_predictions = None
         last_metrics = None
         last_epoch = -1
+        fold_history_rows = []
 
         try:
             for epoch in range(args.epochs):
@@ -716,14 +1104,32 @@ def main(args=None):
                 metrics = all_classification_metrics(valid_agg[args.label].values, valid_agg["prediction"].values)
                 last_metrics = metrics
                 elapsed = time.time() - start
+                is_best_epoch = metrics["AUROC"] > best_auroc
+                fold_history_rows.append({
+                    "fold": fold,
+                    "epoch": epoch + 1,
+                    "eval_split": eval_split_name,
+                    "train_loss": float(train_loss),
+                    "val_loss": float(val_loss),
+                    "eval_loss": float(val_loss),
+                    "auroc": float(metrics["AUROC"]),
+                    "auprc": float(metrics["AUPRC"]),
+                    "bacc": float(metrics["bACC"]),
+                    "lr": float(optimizer.param_groups[0]["lr"]),
+                    "elapsed_sec": float(elapsed),
+                    "is_best": int(is_best_epoch),
+                })
 
-                print(f"Fold {fold} Epoch {epoch+1} - train_loss: {train_loss:.4f}  val_loss: {val_loss:.4f}  "
-                      f"AUROC: {metrics['AUROC']:.4f}  time: {elapsed:.0f}s")
+                print(f"Fold {fold} Epoch {epoch+1} - train_loss: {train_loss:.4f}  "
+                      f"{eval_split_name}_loss: {val_loss:.4f}  AUROC: {metrics['AUROC']:.4f}  "
+                      f"AUPRC: {metrics['AUPRC']:.4f}  bACC: {metrics['bACC']:.4f}  time: {elapsed:.0f}s")
 
-                logger.add_scalar("valid/AUROC", metrics["AUROC"], epoch + 1)
-                logger.add_scalar("valid/loss", val_loss, epoch + 1)
+                logger.add_scalar(f"{eval_split_name}/AUROC", metrics["AUROC"], epoch + 1)
+                logger.add_scalar(f"{eval_split_name}/AUPRC", metrics["AUPRC"], epoch + 1)
+                logger.add_scalar(f"{eval_split_name}/bACC", metrics["bACC"], epoch + 1)
+                logger.add_scalar(f"{eval_split_name}/loss", val_loss, epoch + 1)
 
-                if metrics["AUROC"] > best_auroc:
+                if is_best_epoch:
                     best_auroc = metrics["AUROC"]
                     best_predictions = predictions.copy()
                     best_metrics = metrics
@@ -759,9 +1165,19 @@ def main(args=None):
                 except Exception as e2:
                     print(f"  Could not save emergency checkpoint: {e2}")
 
+        if fold_history_rows:
+            history_df = pd.DataFrame(fold_history_rows)
+            history_csv = output_dir / f"{data_stem}_fold{fold}_loss_history.csv"
+            history_png = output_dir / f"{data_stem}_fold{fold}_loss_curve.png"
+            history_df.to_csv(history_csv, index=False)
+            save_loss_curve(history_df, history_png, title=f"Fold {fold} Loss Curve")
+            all_fold_histories.append(history_df)
+            print(f"  Saved fold {fold} loss history -> {history_csv}")
+            print(f"  Saved fold {fold} loss curve   -> {history_png}")
+
         if best_model_path.exists():
             fold_model_paths.append((fold, best_model_path))
-            if best_predictions is not None:
+            if args.n_folds > 0 and best_predictions is not None:
                 oof_part = valid_df.copy()
                 oof_part["oof_pred_score"] = best_predictions
                 oof_part["oof_fold"] = fold
@@ -772,6 +1188,15 @@ def main(args=None):
         del model, optimizer, scheduler, scaler, criterion
         torch.cuda.empty_cache()
         gc.collect()
+
+    if all_fold_histories:
+        all_history_df = pd.concat(all_fold_histories, ignore_index=True)
+        all_history_csv = output_dir / f"{data_stem}_all_folds_loss_history.csv"
+        all_history_png = output_dir / f"{data_stem}_all_folds_loss_curve.png"
+        all_history_df.to_csv(all_history_csv, index=False)
+        save_all_folds_loss_curve(all_history_df, all_history_png, title="All Folds Loss Curves")
+        print(f"\n[Loss] All folds history saved -> {all_history_csv}")
+        print(f"[Loss] All folds curves saved  -> {all_history_png}")
 
 
     print(f"\n{'=' * 60}")
@@ -790,7 +1215,7 @@ def main(args=None):
     for fold_id, path in fold_model_paths:
         print(f"  Fold {fold_id}: {path}")
 
-    df_all = pd.read_csv(folds_csv)
+    df_all = read_mammo_csv(folds_csv)
     threshold = 0.5
     print("[Predict] Using fixed threshold=0.5 for pred_label. Use pred_score for custom thresholding.")
 
@@ -831,6 +1256,9 @@ def main(args=None):
             print(f"\n[Final] Test set metrics:")
             print(f"  AUROC: {metrics['AUROC']:.4f}")
             print(f"  AUPRC: {metrics['AUPRC']:.4f}")
+            print(f"  bACC:  {metrics['bACC']:.4f}")
+            metrics_csv = output_dir / f"{prediction_stem}_test_metrics.csv"
+            save_metrics_csv(metrics, metrics_csv, split_name="test")
 
     torch.cuda.empty_cache()
     gc.collect()
