@@ -39,6 +39,8 @@ if "--help" in sys.argv or "-h" in sys.argv:
     _p.add_argument("--arch", default="breast_clip_det_b5_period_n_ft",
                     choices=["breast_clip_det_b5_period_n_lp", "breast_clip_det_b5_period_n_ft"],
                     help="lp=linear probe (frozen backbone), ft=full fine-tuning (default: breast_clip_det_b5_period_n_ft)")
+    _p.add_argument("--freeze-backbone", default="auto", choices=["auto", "y", "n"],
+                    help="Freeze Mammo-FM image encoder: y/n, or auto to follow --arch suffix (default: auto)")
 
     _p.add_argument("--n_folds", default=5, type=int, help="Number of CV folds. 0 disables CV (default: 5)")
     _p.add_argument("--epochs", default=10, type=int, help="Max epochs per fold (default: 10)")
@@ -216,6 +218,22 @@ def parse_bool(value, default=False):
     if text in {"0", "false", "f", "no", "n", "off"}:
         return False
     raise ValueError(f"Cannot parse boolean value: {value!r}")
+
+
+def normalize_freeze_backbone(value):
+    if value is None:
+        return "auto"
+    if isinstance(value, bool):
+        return "y" if value else "n"
+
+    text = str(value).strip().lower()
+    if text in {"", "auto", "none"}:
+        return "auto"
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return "y"
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return "n"
+    raise ValueError(f"freeze_backbone must be one of auto, y, or n; got {value!r}")
 
 
 def parse_cohort_spec(value):
@@ -860,6 +878,9 @@ def main(args=None):
                             choices=["breast_clip_det_b5_period_n_lp", "breast_clip_det_b5_period_n_ft"],
                             help="lp=linear probe (frozen backbone), ft=full fine-tuning "
                                  "(default: breast_clip_det_b5_period_n_ft)")
+        parser.add_argument("--freeze-backbone", default="auto", choices=["auto", "y", "n"],
+                            help="Freeze Mammo-FM image encoder: y/n, or auto to follow --arch suffix "
+                                 "(default: auto)")
 
 
         parser.add_argument("--n_folds", default=5, type=int,
@@ -935,6 +956,7 @@ def main(args=None):
 
     args.apex = str(args.apex).lower() == "y"
     args.weighted_bce = str(args.weighted_BCE).lower() == "y"
+    args.freeze_backbone = normalize_freeze_backbone(getattr(args, "freeze_backbone", "auto"))
     args.data_frac = float(args.data_frac)
     args.n_folds = int(args.n_folds)
     if args.n_folds < 0 or args.n_folds == 1:
@@ -966,6 +988,7 @@ def main(args=None):
     print(f"Image dir: {args.img_dir}")
     print(f"Checkpoint: {args.clip_chk_pt_path}")
     print(f"Arch: {args.arch}  |  Folds: {args.n_folds}  |  EarlyStop: {args.early_stop}")
+    print(f"Freeze Backbone: {args.freeze_backbone}")
     print(f"Epochs(max): {args.epochs}  |  Batch: {args.batch_size}  |  LR: {args.lr}")
     print(f"Dataset: {args.dataset}  |  Label: {args.label}  |  Data frac: {args.data_frac}")
     print(f"Weighted BCE: {args.weighted_bce}  |  AMP: {args.apex}")

@@ -8,9 +8,9 @@ python run_finetune.py
 # =============================================================================
 
 # ---- 路径 ----
-DATA_DIR         = r"/opt/localdata/Data/dh/dh_preprocessed/hjj_images"                   # 数据根目录
+DATA_DIR         = r"/home/dhao4/workspace/hjj_workspace/data"                  # 数据根目录
 IMG_DIR          = "images_png"                  # 图片目录
-CSV_FILE         = "embed_data_testcohort_enriched.csv"    # CSV文件
+CSV_FILE         = "/home/dhao4/workspace/hjj_workspace/data/data.csv"    # CSV文件
 CLIP_CHK_PT_PATH = r"./model/Mammo-FM_BatmanlabTrained_CLIP.tar"
 OUTPUT_DIR       = r"./output/finetune_cancer"
 FOLD_CSV         = None                         
@@ -25,11 +25,12 @@ DATASET          = "Custom"
 DATA_FRAC        = "1.0"                       
 LABEL            = "cancer"                      
 ARCH             = "breast_clip_det_b5_period_n_ft"  
+FREEZE_BACKBONE  = "n"   # "y" = freeze Mammo-FM backbone; "n" = full fine-tuning
 
-N_FOLDS          = 5       # 交叉验证折数
+N_FOLDS          = 0       # 交叉验证折数
 EPOCHS           = 25      # 每折最大训练轮数
-EARLY_STOP       = 5       # 早停参数（0=禁用）
-BATCH_SIZE       = 16       # 批大小
+EARLY_STOP       = 3       # 早停参数（0=禁用）
+BATCH_SIZE       = 8       # 批大小
 LR               = 5e-5    # 学习率
 WEIGHT_DECAY     = 1e-4    
 WARMUP_EPOCHS    = 1       
@@ -88,6 +89,7 @@ def build_args():
         data_frac=DATA_FRAC,
         label=LABEL,
         arch=ARCH,
+        freeze_backbone=FREEZE_BACKBONE,
         n_folds=N_FOLDS,
         epochs=EPOCHS,
         early_stop=EARLY_STOP,
@@ -121,6 +123,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"Selected GPU ID:      {GPU_ID}")
     print(f"Folds:                {N_FOLDS}")
+    print(f"Freeze Backbone:      {FREEZE_BACKBONE}")
     print(f"Split By Cohort:      {SPLIT_BY_COHORT}")
     print(f"Train/Test Cohorts:   {TRAIN_COHORTS} / {TEST_COHORTS} ({COHORT_COL})")
     print(f"Overlap Policy:       {OVERLAP_POLICY}")

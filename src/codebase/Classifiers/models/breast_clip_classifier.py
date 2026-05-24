@@ -3,6 +3,21 @@ from torch import nn
 from breastclip.model.modules import load_image_encoder, LinearClassifier
 
 
+def _resolve_freeze_backbone(args, arch):
+    freeze_arg = getattr(args, "freeze_backbone", "auto")
+    if isinstance(freeze_arg, bool):
+        return freeze_arg
+
+    freeze_arg = str(freeze_arg).strip().lower()
+    if freeze_arg in {"", "auto", "none"}:
+        return arch.endswith("_lp")
+    if freeze_arg in {"1", "true", "t", "yes", "y"}:
+        return True
+    if freeze_arg in {"0", "false", "f", "no", "n"}:
+        return False
+    raise ValueError(f"Unsupported freeze_backbone value: {freeze_arg!r}")
+
+
 class BreastClipClassifier(nn.Module):
     def __init__(self, args, ckpt, n_class):
         super(BreastClipClassifier, self).__init__()
@@ -18,8 +33,9 @@ class BreastClipClassifier(nn.Module):
         self.image_encoder.load_state_dict(image_encoder_weights, strict=True)
         self.image_encoder_type = ckpt["config"]["model"]["image_encoder"]["model_type"]
         self.arch = args.arch.lower()
-        if self.arch.endswith("_lp"):
-            print("freezing image encoder to not be trained")
+        self.freeze_backbone = _resolve_freeze_backbone(args, self.arch)
+        if self.freeze_backbone:
+            print("Freezing image encoder; training only the classifier head")
             for param in self.image_encoder.parameters():
                 param.requires_grad = False
 

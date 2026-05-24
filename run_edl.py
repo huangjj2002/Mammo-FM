@@ -40,7 +40,7 @@ DATASET          = "Custom"
 DATA_FRAC        = "1.0"
 LABEL            = "cancer"
 ARCH             = "breast_clip_det_b5_period_n_ft"  # 全量微调
-FREEZE_BACKBONE  = "y"   # "y" = freeze Mammo-FM backbone and train only EDL head; "n" = full fine-tuning
+FREEZE_BACKBONE  = "n"   # "y" = freeze Mammo-FM backbone and train only EDL head; "n" = full fine-tuning
 
 # ---- 训练 ----
 N_FOLDS          = 0       # 交叉验证折数
