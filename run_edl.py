@@ -59,7 +59,7 @@ IMG_SIZE         = [1520, 912]  # 图片尺寸 [高, 宽]
 
 # ---- 设备 ----
 DEVICE           = "cuda"
-GPU_ID           = 4
+GPU_ID           = 2
 APEX             = "y"
 PRINT_FREQ       = 50
 LOG_FREQ         = 200
