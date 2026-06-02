@@ -24,10 +24,11 @@ CSV_FILE         = "/home/dhao4/workspace/hjj_workspace/data/data.csv"    # CSV�
 #IMG_DIR          = r"images_png"                  # 图片目录
 #CSV_FILE         = r"train_with_test_data_mini.csv"    # CSV文件
 CLIP_CHK_PT_PATH = r"./model/Mammo-FM_BatmanlabTrained_CLIP.tar"
-MODEL_SAVE_DIR   = r"./best_model"              # 最佳模型保存目录
-CSV_OUTPUT_DIR   = r"./output"                  # CSV 输出目录
+MODEL_SAVE_DIR   = r"./best_model/run_2"              # 最佳模型保存目录
+CSV_OUTPUT_DIR   = r"./output/run_2"                  # CSV 输出目录
 OUTPUT_DIR       = CSV_OUTPUT_DIR               # 兼容旧参数
-FOLD_CSV         = None                          # None = 自动生成
+FOLD_CSV         = 'data_folds_edl_run2.csv'                          # None = 自动生成
+USE_EXISTING_FOLD_CSV = "n"  # "y" = reuse FOLD_CSV without regenerating/overwriting it
 
 # ---- 数据 ----
 OVERLAP_POLICY   = "test"  # error/test/train for patient split overlap
@@ -44,6 +45,8 @@ FREEZE_BACKBONE  = "n"   # "y" = freeze Mammo-FM backbone and train only EDL hea
 
 # ---- 训练 ----
 N_FOLDS          = 0       # 交叉验证折数
+KFOLD0_VAL_FRAC = 0.2     # Only when N_FOLDS=0: train-pool fraction held out as validation
+KFOLD0_VAL_MAX_FRAC = 0.5 # Only when N_FOLDS=0: max val fraction when expanding single-class val
 EPOCHS           = 25      # 每折最大训练轮数
 EARLY_STOP       = 3       # 早停参数（0=禁用）
 BATCH_SIZE       = 8      # 批大小
@@ -109,13 +112,36 @@ def parse_cli_args():
         choices=["error", "test", "train", "training"],
         help="How to handle patients present in both training and test splits.",
     )
+    parser.add_argument(
+        "--kfold0-val-frac",
+        default=KFOLD0_VAL_FRAC,
+        type=float,
+        help=(
+            "Only used when N_FOLDS=0. Fraction of the training pool held out "
+            f"as validation (default: {KFOLD0_VAL_FRAC}). Values > 1 are treated as percent."
+        ),
+    )
+    parser.add_argument(
+        "--kfold0-val-max-frac",
+        default=KFOLD0_VAL_MAX_FRAC,
+        type=float,
+        help=(
+            "Only used when N_FOLDS=0. Maximum validation fraction when expanding "
+            f"a single-class validation split (default: {KFOLD0_VAL_MAX_FRAC}). "
+            "Values > 1 are treated as percent."
+        ),
+    )
     return parser.parse_args()
 
 
-def build_args(gpu_id=None, overlap_policy=None):
+def build_args(gpu_id=None, overlap_policy=None, kfold0_val_frac=None, kfold0_val_max_frac=None):
     """构建参数 Namespace"""
     resolved_gpu_id = GPU_ID if gpu_id is None else int(gpu_id)
     resolved_overlap_policy = OVERLAP_POLICY if overlap_policy is None else overlap_policy
+    resolved_kfold0_val_frac = KFOLD0_VAL_FRAC if kfold0_val_frac is None else float(kfold0_val_frac)
+    resolved_kfold0_val_max_frac = (
+        KFOLD0_VAL_MAX_FRAC if kfold0_val_max_frac is None else float(kfold0_val_max_frac)
+    )
     args = argparse.Namespace(
         # 路径
         data_dir=DATA_DIR,
@@ -126,6 +152,7 @@ def build_args(gpu_id=None, overlap_policy=None):
         csv_output_dir=CSV_OUTPUT_DIR,
         output_dir=OUTPUT_DIR,
         fold_csv=FOLD_CSV,
+        use_existing_fold_csv=USE_EXISTING_FOLD_CSV,
         overlap_policy=resolved_overlap_policy,
         split_by_cohort=SPLIT_BY_COHORT,
         cohort_col=COHORT_COL,
@@ -139,6 +166,8 @@ def build_args(gpu_id=None, overlap_policy=None):
         freeze_backbone=FREEZE_BACKBONE,
         # 训练
         n_folds=N_FOLDS,
+        kfold0_val_frac=resolved_kfold0_val_frac,
+        kfold0_val_max_frac=resolved_kfold0_val_max_frac,
         epochs=EPOCHS,
         early_stop=EARLY_STOP,
         batch_size=BATCH_SIZE,
@@ -182,7 +211,12 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent))
     from finetune_edl import main as _main
 
-    args = build_args(gpu_id=cli_args.gpu_id, overlap_policy=cli_args.overlap_policy)
+    args = build_args(
+        gpu_id=cli_args.gpu_id,
+        overlap_policy=cli_args.overlap_policy,
+        kfold0_val_frac=cli_args.kfold0_val_frac,
+        kfold0_val_max_frac=cli_args.kfold0_val_max_frac,
+    )
     print("=" * 60)
     print("  Evidential Deep Learning (EDL) Fine-tuning")
     print("=" * 60)
@@ -194,9 +228,12 @@ if __name__ == "__main__":
     print(f"EDL Annealing Start:  {ANNEALING_START}")
     print(f"Freeze Backbone:      {FREEZE_BACKBONE}")
     print(f"Weighted BCE/Data:    {WEIGHTED_BCE}")
+    print(f"KFold0 Val Frac:      {cli_args.kfold0_val_frac}")
+    print(f"KFold0 Val Max Frac:  {cli_args.kfold0_val_max_frac}")
     print(f"Overlap Policy:       {cli_args.overlap_policy}")
     print(f"Split By Cohort:      {SPLIT_BY_COHORT}")
     print(f"Train/Test Cohorts:   {TRAIN_COHORTS} / {TEST_COHORTS} ({COHORT_COL})")
+    print(f"Use Existing Fold CSV: {USE_EXISTING_FOLD_CSV}")
     print(f"Model Save Dir:       {MODEL_SAVE_DIR}")
     print(f"CSV Output Dir:       {CSV_OUTPUT_DIR}")
     print("=" * 60)

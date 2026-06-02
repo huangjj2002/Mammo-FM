@@ -21,7 +21,9 @@ if "--help" in sys.argv or "-h" in sys.argv:
                     default="/mnt/g/Mammo_CLIP_PROJECT/Mammo_FM/Mammo-FM-main/output/finetune_cancer",
                     type=str, help="Directory for checkpoints, logs, and predictions")
     _p.add_argument("--fold-csv", default=None, type=str,
-                    help="Path to save the CSV with fold column. Default: next to --csv-file as *_folds.csv")
+                    help="Path to save or reuse the CSV with fold column. Default: next to --csv-file as *_folds.csv")
+    _p.add_argument("--use-existing-fold-csv", default="n", type=str,
+                    help="Reuse an existing folds CSV instead of generating a new one (default: n)")
     _p.add_argument("--overlap-policy", default="test", choices=["error", "test", "train", "training"],
                     help="How to handle patients present in both train and test splits (default: test)")
     _p.add_argument("--split-by-cohort", default="y", type=str,
@@ -39,10 +41,16 @@ if "--help" in sys.argv or "-h" in sys.argv:
     _p.add_argument("--arch", default="breast_clip_det_b5_period_n_ft",
                     choices=["breast_clip_det_b5_period_n_lp", "breast_clip_det_b5_period_n_ft"],
                     help="lp=linear probe (frozen backbone), ft=full fine-tuning (default: breast_clip_det_b5_period_n_ft)")
-    _p.add_argument("--freeze-backbone", default="auto", choices=["auto", "y", "n"],
-                    help="Freeze Mammo-FM image encoder: y/n, or auto to follow --arch suffix (default: auto)")
+    _p.add_argument("--freeze-backbone", default="n", choices=["y", "n"],
+                    help="Freeze Mammo-FM image encoder: y=freeze backbone, n=full fine-tuning (default: n)")
 
     _p.add_argument("--n_folds", default=5, type=int, help="Number of CV folds. 0 disables CV (default: 5)")
+    _p.add_argument("--kfold0-val-frac", default=0.2, type=float,
+                    help="Only when --n_folds 0: fraction of training pool held out as validation. "
+                         "Values > 1 are treated as percent (default: 0.2)")
+    _p.add_argument("--kfold0-val-max-frac", default=0.5, type=float,
+                    help="Only when --n_folds 0: max validation fraction when expanding a single-class val split. "
+                         "Values > 1 are treated as percent (default: 0.5)")
     _p.add_argument("--epochs", default=10, type=int, help="Max epochs per fold (default: 10)")
     _p.add_argument("--early-stop", default=5, type=int, help="Early stopping patience, 0=disabled (default: 5)")
     _p.add_argument("--batch-size", default=4, type=int, help="Batch size (default: 4)")
@@ -277,13 +285,103 @@ def normalize_split_values(split_series):
     aliases = {
         "train": "train",
         "training": "train",
+        "val": "val",
+        "valid": "val",
+        "validation": "val",
         "test": "test",
     }
     normalized = split_series.astype(str).str.strip().str.lower().map(aliases)
     if normalized.isna().any():
         bad = sorted(set(split_series[normalized.isna()].astype(str).str.strip()))
-        raise ValueError(f"Unsupported split value(s): {bad}. Expected train/training or test.")
+        raise ValueError(f"Unsupported split value(s): {bad}. Expected train/training, val/valid, or test.")
     return normalized
+
+
+def normalize_fraction_arg(value, name):
+    frac = float(value)
+    if frac > 1.0:
+        frac /= 100.0
+    if frac <= 0.0 or frac >= 1.0:
+        raise ValueError(f"{name} must be between 0 and 1, or between 0 and 100 as a percent; got {value!r}.")
+    return frac
+
+
+def assign_kfold0_validation_split(df, train_mask, label_col, val_frac, val_max_frac, seed):
+    """Split the train pool into train/val for n_folds=0 while keeping patients grouped."""
+    val_frac = normalize_fraction_arg(val_frac, "kfold0_val_frac")
+    val_max_frac = normalize_fraction_arg(val_max_frac, "kfold0_val_max_frac")
+    if val_max_frac < val_frac:
+        raise ValueError(
+            f"kfold0_val_max_frac ({val_max_frac:.4f}) must be >= "
+            f"kfold0_val_frac ({val_frac:.4f})."
+        )
+
+    train_df = df[train_mask].copy()
+    patient_info = train_df.groupby("patient_id").agg(
+        label=(label_col, "max"),
+        n_images=("image_id", "count"),
+    ).reset_index()
+    patient_info["label"] = patient_info["label"].astype(int)
+    n_patients = len(patient_info)
+    if n_patients < 2:
+        raise ValueError("Need at least 2 training patients to create a validation split when n_folds=0.")
+
+    rng = np.random.RandomState(seed)
+    patient_info = patient_info.sample(frac=1.0, random_state=rng).reset_index(drop=True)
+    target_val_patients = int(math.ceil(n_patients * val_frac))
+    max_val_patients = int(math.ceil(n_patients * val_max_frac))
+    target_val_patients = min(max(1, target_val_patients), n_patients - 1)
+    max_val_patients = min(max(target_val_patients, max_val_patients), n_patients - 1)
+
+    val_patients = patient_info.head(target_val_patients)["patient_id"].tolist()
+    all_classes = set(patient_info["label"].unique().tolist())
+
+    def current_val_classes():
+        return set(patient_info.loc[patient_info["patient_id"].isin(val_patients), "label"].unique().tolist())
+
+    val_classes = current_val_classes()
+    if len(val_classes) < 2 and len(all_classes) >= 2:
+        missing_classes = sorted(all_classes - val_classes)
+        for missing_class in missing_classes:
+            candidates = patient_info[
+                (~patient_info["patient_id"].isin(val_patients))
+                & (patient_info["label"] == missing_class)
+            ]["patient_id"].tolist()
+            for patient_id in candidates:
+                if len(val_patients) >= max_val_patients:
+                    break
+                val_patients.append(patient_id)
+                val_classes = current_val_classes()
+                if len(val_classes) >= 2:
+                    break
+
+    val_patient_set = set(val_patients)
+    val_mask = train_mask & df["patient_id"].isin(val_patient_set)
+    df.loc[train_mask, "fold"] = 0
+    df.loc[val_mask, "split"] = "val"
+
+    val_rows = int(val_mask.sum())
+    train_rows = int((df["split"] == "train").sum())
+    val_patient_info = patient_info[patient_info["patient_id"].isin(val_patient_set)]
+    val_class_count = val_patient_info["label"].nunique()
+    print(
+        f"[Split] n_folds=0 train/val split: val_frac={val_frac:.3f}, "
+        f"val_max_frac={val_max_frac:.3f}"
+    )
+    print(
+        f"  Train: {train_rows} images, {df.loc[df['split'] == 'train', 'patient_id'].nunique()} patients"
+    )
+    print(
+        f"  Val:   {val_rows} images, {len(val_patient_set)} patients, "
+        f"classes={sorted(val_patient_info['label'].unique().tolist())}"
+    )
+    if val_class_count < 2:
+        print(
+            "  WARNING: Validation split still has one class after expansion. "
+            "Increase kfold0_val_max_frac or add more training data with both classes."
+        )
+
+    return df
 
 
 def create_folds_legacy(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=None):
@@ -410,7 +508,8 @@ def create_folds_legacy(csv_path, label_col="cancer", n_folds=5, seed=42, output
 
 def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=None,
                  overlap_policy="test", split_by_cohort=False, cohort_col="cohort_num",
-                 train_cohorts="1-8", test_cohorts="9-10"):
+                 train_cohorts="1-8", test_cohorts="9-10",
+                 kfold0_val_frac=0.2, kfold0_val_max_frac=0.5):
     rng = np.random.RandomState(seed)
     overlap_policy = str(overlap_policy or "test").strip().lower()
     overlap_policy = {
@@ -491,7 +590,14 @@ def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=N
         raise ValueError("No rows with split == 'train'; cannot create folds.")
 
     if n_folds == 0:
-        df.loc[train_mask, "fold"] = 0
+        df = assign_kfold0_validation_split(
+            df,
+            train_mask,
+            label_col,
+            kfold0_val_frac,
+            kfold0_val_max_frac,
+            seed,
+        )
         csv_path = Path(csv_path)
         if output_path is None:
             output_path = csv_path.parent / f"{csv_path.stem}_folds{csv_path.suffix}"
@@ -500,8 +606,10 @@ def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=N
         output_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(output_path, index=False)
         print(f"[Folds] Saved single-run split CSV -> {output_path}")
-        print(f"  Train (fold=0): {int(train_mask.sum())} images, "
-              f"{df.loc[train_mask, 'patient_id'].nunique()} patients")
+        print(f"  Train (fold=0): {int((df['split'] == 'train').sum())} images, "
+              f"{df.loc[df['split'] == 'train', 'patient_id'].nunique()} patients")
+        print(f"  Val (fold=0): {int((df['split'] == 'val').sum())} images, "
+              f"{df.loc[df['split'] == 'val', 'patient_id'].nunique()} patients")
         print(f"  Test (fold=-1): {int(test_mask.sum())} images, "
               f"{df.loc[test_mask, 'patient_id'].nunique()} patients")
         return output_path
@@ -847,8 +955,10 @@ def main(args=None):
         parser.add_argument("--fold-csv",
                             default=None,
                             type=str,
-                            help="Path to save the CSV with fold column. "
+                            help="Path to save or reuse the CSV with fold column. "
                                  "Default: next to --csv-file as *_folds.csv")
+        parser.add_argument("--use-existing-fold-csv", default="n", type=str,
+                            help="Reuse an existing folds CSV instead of generating a new one (default: n)")
         parser.add_argument("--overlap-policy", default="test", choices=["error", "test", "train", "training"],
                             help="How to handle patients present in both train and test splits (default: test)")
         parser.add_argument("--split-by-cohort", default="y", type=str,
@@ -878,13 +988,19 @@ def main(args=None):
                             choices=["breast_clip_det_b5_period_n_lp", "breast_clip_det_b5_period_n_ft"],
                             help="lp=linear probe (frozen backbone), ft=full fine-tuning "
                                  "(default: breast_clip_det_b5_period_n_ft)")
-        parser.add_argument("--freeze-backbone", default="auto", choices=["auto", "y", "n"],
-                            help="Freeze Mammo-FM image encoder: y/n, or auto to follow --arch suffix "
-                                 "(default: auto)")
+        parser.add_argument("--freeze-backbone", default="n", choices=["y", "n"],
+                            help="Freeze Mammo-FM image encoder: y=freeze backbone, n=full fine-tuning "
+                                 "(default: n)")
 
 
         parser.add_argument("--n_folds", default=5, type=int,
                             help="Number of CV folds. 0 disables CV (default: 5)")
+        parser.add_argument("--kfold0-val-frac", default=0.2, type=float,
+                            help="Only when --n_folds 0: fraction of training pool held out as validation. "
+                                 "Values > 1 are treated as percent (default: 0.2)")
+        parser.add_argument("--kfold0-val-max-frac", default=0.5, type=float,
+                            help="Only when --n_folds 0: max validation fraction when expanding a single-class val split. "
+                                 "Values > 1 are treated as percent (default: 0.5)")
         parser.add_argument("--epochs", default=10, type=int,
                             help="Max epochs per fold (default: 10)")
         parser.add_argument("--early-stop", default=5, type=int,
@@ -956,11 +1072,25 @@ def main(args=None):
 
     args.apex = str(args.apex).lower() == "y"
     args.weighted_bce = str(args.weighted_BCE).lower() == "y"
-    args.freeze_backbone = normalize_freeze_backbone(getattr(args, "freeze_backbone", "auto"))
+    args.freeze_backbone = parse_bool(getattr(args, "freeze_backbone", False), default=False)
+    args.use_existing_fold_csv = parse_bool(getattr(args, "use_existing_fold_csv", False), default=False)
     args.data_frac = float(args.data_frac)
     args.n_folds = int(args.n_folds)
     if args.n_folds < 0 or args.n_folds == 1:
         raise ValueError(f"n_folds must be 0 or >= 2, got {args.n_folds}")
+    args.kfold0_val_frac = normalize_fraction_arg(
+        getattr(args, "kfold0_val_frac", 0.2),
+        "kfold0_val_frac",
+    )
+    args.kfold0_val_max_frac = normalize_fraction_arg(
+        getattr(args, "kfold0_val_max_frac", 0.5),
+        "kfold0_val_max_frac",
+    )
+    if args.kfold0_val_max_frac < args.kfold0_val_frac:
+        raise ValueError(
+            f"kfold0_val_max_frac ({args.kfold0_val_max_frac:.4f}) must be >= "
+            f"kfold0_val_frac ({args.kfold0_val_frac:.4f})."
+        )
     args.split_by_cohort = parse_bool(getattr(args, "split_by_cohort", True), default=True)
     args.cohort_col = str(getattr(args, "cohort_col", "cohort_num"))
     args.train_cohorts = str(getattr(args, "train_cohorts", "1-8"))
@@ -994,19 +1124,37 @@ def main(args=None):
     print(f"Weighted BCE: {args.weighted_bce}  |  AMP: {args.apex}")
     print(f"Overlap Policy: {args.overlap_policy}")
     print(f"Split By Cohort: {args.split_by_cohort}")
+    print(f"Use Existing Fold CSV: {args.use_existing_fold_csv}")
+    if args.n_folds == 0:
+        print(f"KFold0 Val Frac: {args.kfold0_val_frac}")
+        print(f"KFold0 Val Max Frac: {args.kfold0_val_max_frac}")
     if args.split_by_cohort:
         print(f"Cohort Column: {args.cohort_col}  |  Train: {args.train_cohorts}  |  Test: {args.test_cohorts}")
     print("=" * 60)
 
+    if getattr(args, "fold_csv", None) not in (None, ""):
+        fold_csv_path = Path(args.fold_csv)
+    else:
+        fold_csv_path = args.data_csv.parent / f"{args.data_csv.stem}_folds{args.data_csv.suffix}"
 
-    folds_csv = create_folds(args.data_csv, label_col=args.label,
-                             n_folds=args.n_folds, seed=args.seed,
-                             output_path=args.fold_csv,
-                             overlap_policy=args.overlap_policy,
-                             split_by_cohort=args.split_by_cohort,
-                             cohort_col=args.cohort_col,
-                             train_cohorts=args.train_cohorts,
-                             test_cohorts=args.test_cohorts)
+    if args.use_existing_fold_csv:
+        if getattr(args, "fold_csv", None) in (None, ""):
+            raise ValueError("use_existing_fold_csv=y requires fold_csv to point to an existing folds CSV.")
+        if not fold_csv_path.exists():
+            raise FileNotFoundError(f"Requested existing folds CSV does not exist: {fold_csv_path}")
+        folds_csv = fold_csv_path
+        print(f"[Folds] Using existing fold CSV without regenerating -> {folds_csv}")
+    else:
+        folds_csv = create_folds(args.data_csv, label_col=args.label,
+                                 n_folds=args.n_folds, seed=args.seed,
+                                 output_path=fold_csv_path,
+                                 overlap_policy=args.overlap_policy,
+                                 split_by_cohort=args.split_by_cohort,
+                                 cohort_col=args.cohort_col,
+                                 train_cohorts=args.train_cohorts,
+                                 test_cohorts=args.test_cohorts,
+                                 kfold0_val_frac=args.kfold0_val_frac,
+                                 kfold0_val_max_frac=args.kfold0_val_max_frac)
     df = read_mammo_csv(folds_csv)
 
 
@@ -1024,7 +1172,7 @@ def main(args=None):
 
     for fold in fold_ids:
         total_runs = 1 if args.n_folds == 0 else args.n_folds
-        eval_split_name = "test" if args.n_folds == 0 else "val"
+        eval_split_name = "val"
         print(f"\n{'=' * 60}")
         print(f"  Fold {fold} / {total_runs}  |  epoch eval split: {eval_split_name}")
         print(f"{'=' * 60}")
@@ -1035,7 +1183,7 @@ def main(args=None):
         train_pool_mask = df["split"] == "train"
         if args.n_folds == 0:
             train_df = df[train_pool_mask].reset_index(drop=True)
-            valid_df = df[df["split"] == "test"].reset_index(drop=True)
+            valid_df = df[df["split"] == "val"].reset_index(drop=True)
         else:
             train_df = df[train_pool_mask & (df["fold"] != fold)].reset_index(drop=True)
             valid_df = df[train_pool_mask & (df["fold"] == fold)].reset_index(drop=True)
@@ -1272,7 +1420,7 @@ def main(args=None):
     print(f"[Final] pred_label distribution:\n{df_all['pred_label'].value_counts()}")
 
     if args.label in df_all.columns:
-        test_mask = df_all["fold"] == -1
+        test_mask = df_all["split"] == "test"
         test_df = df_all[test_mask]
         if len(test_df) > 0:
             metrics = all_classification_metrics(test_df[args.label].values, test_df["pred_score"].values)

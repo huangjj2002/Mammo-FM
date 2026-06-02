@@ -138,7 +138,7 @@ def kl_divergence(alpha, target):
     dg_alpha = torch.digamma(alpha_hat)
     dg_S_alpha = torch.digamma(S_alpha)
 
-    kl = ln_B_beta - ln_B_alpha \
+    kl = ln_B_alpha - ln_B_beta \
         + torch.sum((alpha_hat - beta) * (dg_alpha - dg_S_alpha), dim=1, keepdim=True)
 
     return kl

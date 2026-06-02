@@ -43,6 +43,8 @@ if "--help" in sys.argv or "-h" in sys.argv:
                     help="Legacy output directory. Used only when new output dirs are not set.")
     _p.add_argument("--fold-csv", default=None, type=str,
                     help="Path to save the CSV with fold column")
+    _p.add_argument("--use-existing-fold-csv", default="n", type=str,
+                    help="Use --fold-csv as-is and skip fold generation/overwrite (default: n)")
     _p.add_argument("--overlap-policy", default="test",
                     choices=["error", "test", "train", "training"],
                     help="How to handle patients present in both train and test splits (default: test)")
@@ -65,6 +67,12 @@ if "--help" in sys.argv or "-h" in sys.argv:
                     help="Freeze Mammo-FM image encoder and train only the EDL head (default: n)")
 
     _p.add_argument("--n_folds", default=5, type=int, help="Number of CV folds. 0 disables CV (default: 5)")
+    _p.add_argument("--kfold0-val-frac", default=0.2, type=float,
+                    help="Only when --n_folds 0: fraction of training pool held out as validation. "
+                         "Values > 1 are treated as percent (default: 0.2)")
+    _p.add_argument("--kfold0-val-max-frac", default=0.5, type=float,
+                    help="Only when --n_folds 0: max validation fraction when expanding a single-class val split. "
+                         "Values > 1 are treated as percent (default: 0.5)")
     _p.add_argument("--epochs", default=10, type=int, help="Max epochs per fold (default: 10)")
     _p.add_argument("--early-stop", default=5, type=int, help="Early stopping patience (default: 5)")
     _p.add_argument("--batch-size", default=4, type=int, help="Batch size (default: 4)")
@@ -315,18 +323,109 @@ def normalize_split_values(split_series):
     aliases = {
         "train": "train",
         "training": "train",
+        "val": "val",
+        "valid": "val",
+        "validation": "val",
         "test": "test",
     }
     normalized = split_series.astype(str).str.strip().str.lower().map(aliases)
     if normalized.isna().any():
         bad = sorted(set(split_series[normalized.isna()].astype(str).str.strip()))
-        raise ValueError(f"Unsupported split value(s): {bad}. Expected train/training or test.")
+        raise ValueError(f"Unsupported split value(s): {bad}. Expected train/training, val/valid, or test.")
     return normalized
+
+
+def normalize_fraction_arg(value, name):
+    frac = float(value)
+    if frac > 1.0:
+        frac /= 100.0
+    if frac <= 0.0 or frac >= 1.0:
+        raise ValueError(f"{name} must be between 0 and 1, or between 0 and 100 as a percent; got {value!r}.")
+    return frac
+
+
+def assign_kfold0_validation_split(df, train_mask, label_col, val_frac, val_max_frac, seed):
+    """Split the train pool into train/val for n_folds=0 while keeping patients grouped."""
+    val_frac = normalize_fraction_arg(val_frac, "kfold0_val_frac")
+    val_max_frac = normalize_fraction_arg(val_max_frac, "kfold0_val_max_frac")
+    if val_max_frac < val_frac:
+        raise ValueError(
+            f"kfold0_val_max_frac ({val_max_frac:.4f}) must be >= "
+            f"kfold0_val_frac ({val_frac:.4f})."
+        )
+
+    train_df = df[train_mask].copy()
+    patient_info = train_df.groupby("patient_id").agg(
+        label=(label_col, "max"),
+        n_images=("image_id", "count"),
+    ).reset_index()
+    patient_info["label"] = patient_info["label"].astype(int)
+    n_patients = len(patient_info)
+    if n_patients < 2:
+        raise ValueError("Need at least 2 training patients to create a validation split when n_folds=0.")
+
+    rng = np.random.RandomState(seed)
+    patient_info = patient_info.sample(frac=1.0, random_state=rng).reset_index(drop=True)
+    target_val_patients = int(math.ceil(n_patients * val_frac))
+    max_val_patients = int(math.ceil(n_patients * val_max_frac))
+    target_val_patients = min(max(1, target_val_patients), n_patients - 1)
+    max_val_patients = min(max(target_val_patients, max_val_patients), n_patients - 1)
+
+    val_patients = patient_info.head(target_val_patients)["patient_id"].tolist()
+    all_classes = set(patient_info["label"].unique().tolist())
+
+    def current_val_classes():
+        return set(patient_info.loc[patient_info["patient_id"].isin(val_patients), "label"].unique().tolist())
+
+    val_classes = current_val_classes()
+    if len(val_classes) < 2 and len(all_classes) >= 2:
+        missing_classes = sorted(all_classes - val_classes)
+        for missing_class in missing_classes:
+            candidates = patient_info[
+                (~patient_info["patient_id"].isin(val_patients))
+                & (patient_info["label"] == missing_class)
+            ]["patient_id"].tolist()
+            for patient_id in candidates:
+                if len(val_patients) >= max_val_patients:
+                    break
+                val_patients.append(patient_id)
+                val_classes = current_val_classes()
+                if len(val_classes) >= 2:
+                    break
+
+    val_patient_set = set(val_patients)
+    val_mask = train_mask & df["patient_id"].isin(val_patient_set)
+    df.loc[train_mask, "fold"] = 0
+    df.loc[val_mask, "split"] = "val"
+
+    val_rows = int(val_mask.sum())
+    train_rows = int((df["split"] == "train").sum())
+    val_patient_info = patient_info[patient_info["patient_id"].isin(val_patient_set)]
+    val_class_count = val_patient_info["label"].nunique()
+    print(
+        f"[Split] n_folds=0 train/val split: val_frac={val_frac:.3f}, "
+        f"val_max_frac={val_max_frac:.3f}"
+    )
+    print(
+        f"  Train: {train_rows} images, {df.loc[df['split'] == 'train', 'patient_id'].nunique()} patients"
+    )
+    print(
+        f"  Val:   {val_rows} images, {len(val_patient_set)} patients, "
+        f"classes={sorted(val_patient_info['label'].unique().tolist())}"
+    )
+    if val_class_count < 2:
+        print(
+            "  WARNING: Validation split still has one class after expansion. "
+            "Increase kfold0_val_max_frac or add more training data with both classes."
+        )
+
+    return df
 
 
 def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=None,
                  overlap_policy="test", split_by_cohort=False, cohort_col="cohort_num",
-                 train_cohorts="1-8", test_cohorts="9-10"):
+                 train_cohorts="1-8", test_cohorts="9-10",
+                 kfold0_val_frac=0.2, kfold0_val_max_frac=0.5):
     """Create patient-grouped folds and a normalized train/test split CSV."""
     rng = np.random.RandomState(seed)
     overlap_policy = str(overlap_policy or "test").strip().lower()
@@ -415,7 +514,14 @@ def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=N
         raise ValueError("No rows with split == 'train'; cannot create folds.")
 
     if n_folds == 0:
-        df.loc[train_mask, "fold"] = 0
+        df = assign_kfold0_validation_split(
+            df,
+            train_mask,
+            label_col,
+            kfold0_val_frac,
+            kfold0_val_max_frac,
+            seed,
+        )
         csv_path = Path(csv_path)
         if output_path is None:
             output_path = Path.cwd() / f"{csv_path.stem}_folds{csv_path.suffix}"
@@ -424,8 +530,10 @@ def create_folds(csv_path, label_col="cancer", n_folds=5, seed=42, output_path=N
         output_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(output_path, index=False)
         print(f"[Folds] Saved single-run split CSV -> {output_path}")
-        print(f"  Train (fold=0): {int(train_mask.sum())} images, "
-              f"{df.loc[train_mask, 'patient_id'].nunique()} patients")
+        print(f"  Train (fold=0): {int((df['split'] == 'train').sum())} images, "
+              f"{df.loc[df['split'] == 'train', 'patient_id'].nunique()} patients")
+        print(f"  Val (fold=0): {int((df['split'] == 'val').sum())} images, "
+              f"{df.loc[df['split'] == 'val', 'patient_id'].nunique()} patients")
         print(f"  Test (fold=-1): {int(test_mask.sum())} images, "
               f"{df.loc[test_mask, 'patient_id'].nunique()} patients")
         return output_path
@@ -654,6 +762,28 @@ def save_all_folds_loss_curve(history_df, output_path, title):
     plt.close(fig)
 
 
+def get_edl_annealing_value(epoch, total_epochs, annealing_step=None, annealing_start_frac=0.0):
+    if annealing_step not in (None, ""):
+        annealing_step = float(annealing_step)
+        return min(1.0, (float(epoch) + 1.0) / max(annealing_step, 1.0))
+
+    annealing_start_epoch = float(annealing_start_frac) * float(total_epochs)
+    if float(epoch) < annealing_start_epoch:
+        return 0.0
+
+    progress = (float(epoch) - annealing_start_epoch) / max(float(total_epochs) - annealing_start_epoch, 1.0)
+    return min(1.0, progress)
+
+
+def is_edl_annealing_complete(epoch, total_epochs, annealing_step=None, annealing_start_frac=0.0):
+    return get_edl_annealing_value(
+        epoch,
+        total_epochs,
+        annealing_step=annealing_step,
+        annealing_start_frac=annealing_start_frac,
+    ) >= 1.0 - 1e-12
+
+
 # ==================== Training ====================
 
 def train_epoch(model, loader, criterion, optimizer, scheduler, scaler,
@@ -819,7 +949,7 @@ def predict_all_edl(model_paths, df_all, img_dir, args, device, threshold=None):
 
         dataset = CustomMammoDataset(df_all, img_dir,
                                      label_col=args.label,
-                                     transform=get_val_transform(tuple(args.img_size)),
+                                     transform=None,
                                      mean=args.mean, std=args.std)
         loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, pin_memory=True,
@@ -990,6 +1120,7 @@ def main(args=None):
         parser.add_argument("--csv-output-dir", default=None, type=str)
         parser.add_argument("--output-dir", default=None, type=str)
         parser.add_argument("--fold-csv", default=None, type=str)
+        parser.add_argument("--use-existing-fold-csv", default="n", type=str)
         parser.add_argument("--overlap-policy", default="test",
                             choices=["error", "test", "train", "training"])
         parser.add_argument("--split-by-cohort", default="y", type=str)
@@ -1007,6 +1138,8 @@ def main(args=None):
 
         # 训练参数
         parser.add_argument("--n_folds", default=5, type=int)
+        parser.add_argument("--kfold0-val-frac", default=0.2, type=float)
+        parser.add_argument("--kfold0-val-max-frac", default=0.5, type=float)
         parser.add_argument("--epochs", default=10, type=int)
         parser.add_argument("--early-stop", default=5, type=int)
         parser.add_argument("--batch-size", default=4, type=int)
@@ -1073,9 +1206,26 @@ def main(args=None):
     if not hasattr(args, "weighted_BCE"):
         args.weighted_BCE = getattr(args, "weighted_bce", "y")
     args.weighted_bce = str(args.weighted_BCE).lower() in {"1", "true", "t", "yes", "y"}
+    args.use_existing_fold_csv = parse_bool(
+        getattr(args, "use_existing_fold_csv", False),
+        default=False,
+    )
     args.n_folds = int(args.n_folds)
     if args.n_folds < 0 or args.n_folds == 1:
         raise ValueError(f"n_folds must be 0 or >= 2, got {args.n_folds}")
+    args.kfold0_val_frac = normalize_fraction_arg(
+        getattr(args, "kfold0_val_frac", 0.2),
+        "kfold0_val_frac",
+    )
+    args.kfold0_val_max_frac = normalize_fraction_arg(
+        getattr(args, "kfold0_val_max_frac", 0.5),
+        "kfold0_val_max_frac",
+    )
+    if args.kfold0_val_max_frac < args.kfold0_val_frac:
+        raise ValueError(
+            f"kfold0_val_max_frac ({args.kfold0_val_max_frac:.4f}) must be >= "
+            f"kfold0_val_frac ({args.kfold0_val_frac:.4f})."
+        )
     args.split_by_cohort = parse_bool(getattr(args, "split_by_cohort", True), default=True)
     args.cohort_col = str(getattr(args, "cohort_col", "cohort_num"))
     args.train_cohorts = str(getattr(args, "train_cohorts", "1-8"))
@@ -1155,6 +1305,10 @@ def main(args=None):
     print(f"Weighted BCE/Data Loss: {args.weighted_bce}")
     print(f"Overlap Policy: {args.overlap_policy}")
     print(f"Split By Cohort: {args.split_by_cohort}")
+    print(f"Use Existing Fold CSV: {args.use_existing_fold_csv}")
+    if args.n_folds == 0:
+        print(f"KFold0 Val Frac: {args.kfold0_val_frac}")
+        print(f"KFold0 Val Max Frac: {args.kfold0_val_max_frac}")
     if args.split_by_cohort:
         print(f"Cohort Column: {args.cohort_col}  |  Train: {args.train_cohorts}  |  Test: {args.test_cohorts}")
     print(f"Num Classes: {args.num_classes}")
@@ -1167,14 +1321,25 @@ def main(args=None):
             fold_csv_path = csv_output_dir / fold_csv_path
     else:
         fold_csv_path = csv_output_dir / f"{Path(args.data_csv).stem}_folds.csv"
-    folds_csv = create_folds(args.data_csv, label_col=args.label,
-                             n_folds=args.n_folds, seed=args.seed,
-                             output_path=fold_csv_path,
-                             overlap_policy=args.overlap_policy,
-                             split_by_cohort=args.split_by_cohort,
-                             cohort_col=args.cohort_col,
-                             train_cohorts=args.train_cohorts,
-                             test_cohorts=args.test_cohorts)
+
+    if args.use_existing_fold_csv:
+        if getattr(args, "fold_csv", None) in (None, ""):
+            raise ValueError("use_existing_fold_csv=y requires fold_csv to point to an existing folds CSV.")
+        if not fold_csv_path.exists():
+            raise FileNotFoundError(f"Requested existing folds CSV does not exist: {fold_csv_path}")
+        folds_csv = fold_csv_path
+        print(f"[Folds] Using existing fold CSV without regenerating -> {folds_csv}")
+    else:
+        folds_csv = create_folds(args.data_csv, label_col=args.label,
+                                 n_folds=args.n_folds, seed=args.seed,
+                                 output_path=fold_csv_path,
+                                 overlap_policy=args.overlap_policy,
+                                 split_by_cohort=args.split_by_cohort,
+                                 cohort_col=args.cohort_col,
+                                 train_cohorts=args.train_cohorts,
+                                 test_cohorts=args.test_cohorts,
+                                 kfold0_val_frac=args.kfold0_val_frac,
+                                 kfold0_val_max_frac=args.kfold0_val_max_frac)
     df = read_mammo_csv(folds_csv)
 
     # ---- 加载基础 checkpoint ----
@@ -1193,7 +1358,7 @@ def main(args=None):
 
     for fold in fold_ids:
         total_runs = 1 if args.n_folds == 0 else args.n_folds
-        eval_split_name = "test" if args.n_folds == 0 else "val"
+        eval_split_name = "val"
         print(f"\n{'=' * 60}")
         print(f"  Fold {fold} / {total_runs}  |  epoch eval split: {eval_split_name}")
         print(f"{'=' * 60}")
@@ -1203,7 +1368,7 @@ def main(args=None):
         train_pool_mask = df["split"] == "train"
         if args.n_folds == 0:
             train_df = df[train_pool_mask].reset_index(drop=True)
-            valid_df = df[df["split"] == "test"].reset_index(drop=True)
+            valid_df = df[df["split"] == "val"].reset_index(drop=True)
         else:
             train_df = df[train_pool_mask & (df["fold"] != fold)].reset_index(drop=True)
             valid_df = df[train_pool_mask & (df["fold"] == fold)].reset_index(drop=True)
@@ -1324,13 +1489,20 @@ def main(args=None):
                 valid_df_fold["prediction"] = pred_score
                 valid_agg = valid_df_fold.groupby("patient_id").agg({
                     args.label: "max",
-                    "prediction": "mean",
+                    "prediction": "max",
                 })
                 metrics = all_classification_metrics(valid_agg[args.label].values,
                                                      valid_agg["prediction"].values)
                 last_metrics = metrics
                 elapsed = time.time() - start
                 mean_uncertainty = float(np.mean(uncertainties))
+                annealing_value = get_edl_annealing_value(
+                    epoch,
+                    args.epochs,
+                    annealing_step=args.annealing_step,
+                    annealing_start_frac=args.annealing_start_frac,
+                )
+                annealing_complete = annealing_value >= 1.0 - 1e-12
                 is_best_epoch = metrics["AUROC"] > best_auroc
                 fold_history_rows.append({
                     "fold": fold,
@@ -1343,6 +1515,8 @@ def main(args=None):
                     "auprc": float(metrics["AUPRC"]),
                     "bacc": float(metrics["bACC"]),
                     "mean_uncertainty": mean_uncertainty,
+                    "edl_annealing_value": float(annealing_value),
+                    "annealing_complete": int(annealing_complete),
                     "lr": float(optimizer.param_groups[0]["lr"]),
                     "elapsed_sec": float(elapsed),
                     "is_best": int(is_best_epoch),
@@ -1357,6 +1531,7 @@ def main(args=None):
                 logger.add_scalar(f"{eval_split_name}/bACC", metrics["bACC"], epoch + 1)
                 logger.add_scalar(f"{eval_split_name}/loss", val_loss, epoch + 1)
                 logger.add_scalar(f"{eval_split_name}/mean_uncertainty", mean_uncertainty, epoch + 1)
+                logger.add_scalar("train/edl_annealing_value", annealing_value, epoch + 1)
 
                 if is_best_epoch:
                     best_auroc = metrics["AUROC"]
@@ -1374,9 +1549,16 @@ def main(args=None):
                     saved_best = True
                     print(f"  -> Saved best (AUROC={best_auroc:.4f})")
 
-                if early_stopper is not None and early_stopper(metrics["AUROC"]):
-                    print(f"  -> Early stopping at epoch {epoch+1} (best AUROC={early_stopper.best_score:.4f})")
-                    break
+                if early_stopper is not None:
+                    if annealing_complete:
+                        if early_stopper(metrics["AUROC"]):
+                            print(f"  -> Early stopping at epoch {epoch+1} (best AUROC={early_stopper.best_score:.4f})")
+                            break
+                    else:
+                        print(
+                            f"  -> Annealing in progress ({annealing_value:.3f}); "
+                            "early stopping will start after annealing completes."
+                        )
 
             if not saved_best:
                 print(f"  WARNING: No best model was saved for fold {fold}. Saving last epoch as fallback.")
@@ -1500,16 +1682,11 @@ def main(args=None):
 
     # ---- 测试集指标 ----
     if args.label in ensemble_df.columns:
-        test_mask = ensemble_df["fold"] == -1
+        test_mask = ensemble_df["split"] == "test"
         test_df = ensemble_df[test_mask]
         if len(test_df) > 0:
-            test_agg = test_df.groupby("patient_id").agg({
-                args.label: "max",
-                "pred_score": "mean",
-            })
-            metrics = all_classification_metrics(test_agg[args.label].values,
-                                                 test_agg["pred_score"].values)
-            print(f"\n[Final] Test set metrics (patient-level mean prediction):")
+            metrics = all_classification_metrics(test_df[args.label].values, test_df["pred_score"].values)
+            print(f"\n[Final] Test set metrics:")
             print(f"  AUROC: {metrics['AUROC']:.4f}")
             print(f"  AUPRC: {metrics['AUPRC']:.4f}")
             print(f"  bACC:  {metrics['bACC']:.4f}")

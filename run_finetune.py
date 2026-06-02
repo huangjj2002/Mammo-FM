@@ -13,7 +13,8 @@ IMG_DIR          = "images_png"                  # 图片目录
 CSV_FILE         = "/home/dhao4/workspace/hjj_workspace/data/data.csv"    # CSV文件
 CLIP_CHK_PT_PATH = r"./model/Mammo-FM_BatmanlabTrained_CLIP.tar"
 OUTPUT_DIR       = r"./output/finetune_cancer"
-FOLD_CSV         = None                         
+FOLD_CSV         = "data_folds.csv"                        
+USE_EXISTING_FOLD_CSV = "n"
 OVERLAP_POLICY   = "test"  # error/test/train for patient split overlap
 SPLIT_BY_COHORT  = "y"
 COHORT_COL       = "cohort_num"
@@ -28,6 +29,8 @@ ARCH             = "breast_clip_det_b5_period_n_ft"
 FREEZE_BACKBONE  = "n"   # "y" = freeze Mammo-FM backbone; "n" = full fine-tuning
 
 N_FOLDS          = 0       # 交叉验证折数
+KFOLD0_VAL_FRAC = 0.2     # Only when N_FOLDS=0: train-pool fraction held out as validation
+KFOLD0_VAL_MAX_FRAC = 0.5 # Only when N_FOLDS=0: max val fraction when expanding single-class val
 EPOCHS           = 25      # 每折最大训练轮数
 EARLY_STOP       = 3       # 早停参数（0=禁用）
 BATCH_SIZE       = 8       # 批大小
@@ -80,6 +83,7 @@ def build_args():
         clip_chk_pt_path=CLIP_CHK_PT_PATH,
         output_dir=OUTPUT_DIR,
         fold_csv=FOLD_CSV,
+        use_existing_fold_csv=USE_EXISTING_FOLD_CSV,
         overlap_policy=OVERLAP_POLICY,
         split_by_cohort=SPLIT_BY_COHORT,
         cohort_col=COHORT_COL,
@@ -91,6 +95,8 @@ def build_args():
         arch=ARCH,
         freeze_backbone=FREEZE_BACKBONE,
         n_folds=N_FOLDS,
+        kfold0_val_frac=KFOLD0_VAL_FRAC,
+        kfold0_val_max_frac=KFOLD0_VAL_MAX_FRAC,
         epochs=EPOCHS,
         early_stop=EARLY_STOP,
         batch_size=BATCH_SIZE,
@@ -123,7 +129,10 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"Selected GPU ID:      {GPU_ID}")
     print(f"Folds:                {N_FOLDS}")
+    print(f"KFold0 Val Frac:      {KFOLD0_VAL_FRAC}")
+    print(f"KFold0 Val Max Frac:  {KFOLD0_VAL_MAX_FRAC}")
     print(f"Freeze Backbone:      {FREEZE_BACKBONE}")
+    print(f"Use Existing Fold CSV:{USE_EXISTING_FOLD_CSV}")
     print(f"Split By Cohort:      {SPLIT_BY_COHORT}")
     print(f"Train/Test Cohorts:   {TRAIN_COHORTS} / {TEST_COHORTS} ({COHORT_COL})")
     print(f"Overlap Policy:       {OVERLAP_POLICY}")
