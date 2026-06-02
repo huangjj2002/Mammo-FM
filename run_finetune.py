@@ -64,6 +64,7 @@ STD              = 0.25053555408335154
 
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU_ID)
@@ -74,15 +75,30 @@ from finetune_cancer import main as _main
 import argparse
 
 
+RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def append_timestamp_path(path_str, timestamp):
+    path_obj = Path(path_str)
+    return str(path_obj.with_name(f"{path_obj.name}_{timestamp}"))
+
+
 def build_args():
+    output_dir = append_timestamp_path(OUTPUT_DIR, RUN_TIMESTAMP)
+    if str(USE_EXISTING_FOLD_CSV).lower() in {"1", "true", "t", "yes", "y"}:
+        fold_csv = FOLD_CSV
+    elif FOLD_CSV in (None, ""):
+        fold_csv = None
+    else:
+        fold_csv = str(Path(output_dir) / FOLD_CSV)
   
     args = argparse.Namespace(
         data_dir=DATA_DIR,
         img_dir=IMG_DIR,
         csv_file=CSV_FILE,
         clip_chk_pt_path=CLIP_CHK_PT_PATH,
-        output_dir=OUTPUT_DIR,
-        fold_csv=FOLD_CSV,
+        output_dir=output_dir,
+        fold_csv=fold_csv,
         use_existing_fold_csv=USE_EXISTING_FOLD_CSV,
         overlap_policy=OVERLAP_POLICY,
         split_by_cohort=SPLIT_BY_COHORT,
@@ -133,6 +149,9 @@ if __name__ == "__main__":
     print(f"KFold0 Val Max Frac:  {KFOLD0_VAL_MAX_FRAC}")
     print(f"Freeze Backbone:      {FREEZE_BACKBONE}")
     print(f"Use Existing Fold CSV:{USE_EXISTING_FOLD_CSV}")
+    print(f"Run Timestamp:        {RUN_TIMESTAMP}")
+    print(f"Output Dir:           {args.output_dir}")
+    print(f"Fold CSV:             {args.fold_csv}")
     print(f"Split By Cohort:      {SPLIT_BY_COHORT}")
     print(f"Train/Test Cohorts:   {TRAIN_COHORTS} / {TEST_COHORTS} ({COHORT_COL})")
     print(f"Overlap Policy:       {OVERLAP_POLICY}")

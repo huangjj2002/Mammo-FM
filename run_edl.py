@@ -90,10 +90,17 @@ ANNEALING_START  = 0.0          # KL 退火开始比例（0.0=从头开始，0.5
 
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 import argparse
 
 ANNEALING_STEP = EPOCHS
+RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def append_timestamp_path(path_str, timestamp):
+    path_obj = Path(path_str)
+    return str(path_obj.with_name(f"{path_obj.name}_{timestamp}"))
 
 
 def parse_cli_args():
@@ -142,15 +149,18 @@ def build_args(gpu_id=None, overlap_policy=None, kfold0_val_frac=None, kfold0_va
     resolved_kfold0_val_max_frac = (
         KFOLD0_VAL_MAX_FRAC if kfold0_val_max_frac is None else float(kfold0_val_max_frac)
     )
+    model_save_dir = append_timestamp_path(MODEL_SAVE_DIR, RUN_TIMESTAMP)
+    csv_output_dir = append_timestamp_path(CSV_OUTPUT_DIR, RUN_TIMESTAMP)
+    output_dir = csv_output_dir
     args = argparse.Namespace(
         # 路径
         data_dir=DATA_DIR,
         img_dir=IMG_DIR,
         csv_file=CSV_FILE,
         clip_chk_pt_path=CLIP_CHK_PT_PATH,
-        model_save_dir=MODEL_SAVE_DIR,
-        csv_output_dir=CSV_OUTPUT_DIR,
-        output_dir=OUTPUT_DIR,
+        model_save_dir=model_save_dir,
+        csv_output_dir=csv_output_dir,
+        output_dir=output_dir,
         fold_csv=FOLD_CSV,
         use_existing_fold_csv=USE_EXISTING_FOLD_CSV,
         overlap_policy=resolved_overlap_policy,
@@ -228,13 +238,14 @@ if __name__ == "__main__":
     print(f"EDL Annealing Start:  {ANNEALING_START}")
     print(f"Freeze Backbone:      {FREEZE_BACKBONE}")
     print(f"Weighted BCE/Data:    {WEIGHTED_BCE}")
+    print(f"Run Timestamp:        {RUN_TIMESTAMP}")
     print(f"KFold0 Val Frac:      {cli_args.kfold0_val_frac}")
     print(f"KFold0 Val Max Frac:  {cli_args.kfold0_val_max_frac}")
     print(f"Overlap Policy:       {cli_args.overlap_policy}")
     print(f"Split By Cohort:      {SPLIT_BY_COHORT}")
     print(f"Train/Test Cohorts:   {TRAIN_COHORTS} / {TEST_COHORTS} ({COHORT_COL})")
     print(f"Use Existing Fold CSV: {USE_EXISTING_FOLD_CSV}")
-    print(f"Model Save Dir:       {MODEL_SAVE_DIR}")
-    print(f"CSV Output Dir:       {CSV_OUTPUT_DIR}")
+    print(f"Model Save Dir:       {args.model_save_dir}")
+    print(f"CSV Output Dir:       {args.csv_output_dir}")
     print("=" * 60)
     _main(args)
