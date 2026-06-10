@@ -23,6 +23,14 @@ OUTPUT_DIR = CSV_OUTPUT_DIR
 FOLD_CSV = "data_folds_proto_edl_run1.csv"
 USE_EXISTING_FOLD_CSV = "n"
 
+# ---- Input mode ----
+# Default remains image mode. Switch to "embedding" to train only the
+# Prototype-EDL head from a pre-exported embeddings.npy + metadata.csv bundle.
+INPUT_MODE = "image"
+EMBEDDING_DIR = r"./output/origin_embeddings_finetuned_fold0"
+EMBEDDINGS_FILE = "embeddings.npy"
+METADATA_FILE = "metadata.csv"
+
 # ---- Data ----
 OVERLAP_POLICY = "test"
 SPLIT_BY_COHORT = "y"
@@ -111,6 +119,33 @@ def parse_cli_args():
     )
     parser.add_argument("--gpu-id", default=GPU_ID, type=int, help=f"GPU device ID (default: {GPU_ID})")
     parser.add_argument(
+        "--input-mode",
+        default=INPUT_MODE,
+        choices=["image", "embedding"],
+        help=f"Input source for Prototype-EDL training (default: {INPUT_MODE}).",
+    )
+    parser.add_argument(
+        "--embedding-dir",
+        default=EMBEDDING_DIR,
+        type=str,
+        help=(
+            "Directory containing embeddings.npy, metadata.csv, and manifest.json. "
+            "Only used with --input-mode embedding."
+        ),
+    )
+    parser.add_argument(
+        "--embeddings-file",
+        default=EMBEDDINGS_FILE,
+        type=str,
+        help=f"Embedding array filename inside --embedding-dir (default: {EMBEDDINGS_FILE}).",
+    )
+    parser.add_argument(
+        "--metadata-file",
+        default=METADATA_FILE,
+        type=str,
+        help=f"Metadata CSV filename inside --embedding-dir (default: {METADATA_FILE}).",
+    )
+    parser.add_argument(
         "--overlap-policy",
         default=OVERLAP_POLICY,
         choices=["error", "test", "train", "training"],
@@ -147,12 +182,20 @@ def parse_cli_args():
 
 def build_args(
     gpu_id=None,
+    input_mode=None,
+    embedding_dir=None,
+    embeddings_file=None,
+    metadata_file=None,
     overlap_policy=None,
     kfold0_val_frac=None,
     kfold0_val_max_frac=None,
     edl_proto_loss_weight=None,
 ):
     resolved_gpu_id = GPU_ID if gpu_id is None else int(gpu_id)
+    resolved_input_mode = INPUT_MODE if input_mode is None else str(input_mode).strip().lower()
+    resolved_embedding_dir = EMBEDDING_DIR if embedding_dir is None else str(embedding_dir)
+    resolved_embeddings_file = EMBEDDINGS_FILE if embeddings_file is None else str(embeddings_file)
+    resolved_metadata_file = METADATA_FILE if metadata_file is None else str(metadata_file)
     resolved_overlap_policy = OVERLAP_POLICY if overlap_policy is None else overlap_policy
     resolved_kfold0_val_frac = KFOLD0_VAL_FRAC if kfold0_val_frac is None else float(kfold0_val_frac)
     resolved_kfold0_val_max_frac = (
@@ -174,6 +217,10 @@ def build_args(
         output_dir=output_dir,
         fold_csv=FOLD_CSV,
         use_existing_fold_csv=USE_EXISTING_FOLD_CSV,
+        input_mode=resolved_input_mode,
+        embedding_dir=resolved_embedding_dir,
+        embeddings_file=resolved_embeddings_file,
+        metadata_file=resolved_metadata_file,
         overlap_policy=resolved_overlap_policy,
         split_by_cohort=SPLIT_BY_COHORT,
         cohort_col=COHORT_COL,
@@ -237,6 +284,10 @@ if __name__ == "__main__":
 
     args = build_args(
         gpu_id=cli_args.gpu_id,
+        input_mode=cli_args.input_mode,
+        embedding_dir=cli_args.embedding_dir,
+        embeddings_file=cli_args.embeddings_file,
+        metadata_file=cli_args.metadata_file,
         overlap_policy=cli_args.overlap_policy,
         kfold0_val_frac=cli_args.kfold0_val_frac,
         kfold0_val_max_frac=cli_args.kfold0_val_max_frac,
@@ -246,6 +297,11 @@ if __name__ == "__main__":
     print("  Prototype + Evidential Deep Learning (EDL) Fine-tuning")
     print("=" * 60)
     print(f"Selected GPU ID:      {cli_args.gpu_id}")
+    print(f"Input Mode:           {cli_args.input_mode}")
+    if cli_args.input_mode == "embedding":
+        print(f"Embedding Dir:        {cli_args.embedding_dir}")
+        print(f"Embeddings File:      {cli_args.embeddings_file}")
+        print(f"Metadata File:        {cli_args.metadata_file}")
     print(f"EDL Loss Type:        {EDL_LOSS_TYPE}")
     print(f"EDL KL Weight:        {EDL_KL_WEIGHT}")
     print(f"EDL Annealing Step:   {ANNEALING_STEP}")

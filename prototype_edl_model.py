@@ -114,44 +114,55 @@ class MammoPrototypeEDLModel(nn.Module):
     def __init__(
         self,
         args,
-        ckpt,
+        ckpt=None,
         num_classes=2,
         evidence_type="softplus",
         prototypes_per_class=4,
         temperature=1.0,
         similarity="neg_sq_exp",
         normalize_embeddings=True,
+        feature_dim=None,
     ):
         super().__init__()
         if int(num_classes) != 2:
             raise ValueError(f"Prototype EDL currently supports binary classification only, got {num_classes}")
 
-        from breastclip.model.modules import load_image_encoder
-
-        print(ckpt["config"]["model"]["image_encoder"])
-        self.config = ckpt["config"]["model"]["image_encoder"]
-        self.image_encoder = load_image_encoder(ckpt["config"]["model"]["image_encoder"])
-
-        image_encoder_weights = {}
-        for key, value in ckpt["model"].items():
-            if key.startswith("image_encoder."):
-                image_encoder_weights[".".join(key.split(".")[1:])] = value
-        self.image_encoder.load_state_dict(image_encoder_weights, strict=True)
-
-        self.image_encoder_type = ckpt["config"]["model"]["image_encoder"]["model_type"]
         self.arch = str(getattr(args, "arch", "")).lower()
         self.freeze_backbone = _as_bool(getattr(args, "freeze_backbone", False), default=False)
-        if self.freeze_backbone:
-            print("Freezing image encoder; training only the Prototype EDL head")
-            for param in self.image_encoder.parameters():
-                param.requires_grad = False
-
         self.num_classes = 2
         self.store_features = bool(getattr(args, "store_features", False))
         self.raw_features = None
         self.pool_features = None
+
+        if ckpt is None:
+            if feature_dim is None:
+                raise ValueError("feature_dim is required when ckpt=None for embedding input mode.")
+            self.config = {"model_type": "embedding", "out_dim": int(feature_dim)}
+            self.image_encoder = None
+            self.image_encoder_type = "embedding"
+            in_features = int(feature_dim)
+        else:
+            from breastclip.model.modules import load_image_encoder
+
+            print(ckpt["config"]["model"]["image_encoder"])
+            self.config = ckpt["config"]["model"]["image_encoder"]
+            self.image_encoder = load_image_encoder(ckpt["config"]["model"]["image_encoder"])
+
+            image_encoder_weights = {}
+            for key, value in ckpt["model"].items():
+                if key.startswith("image_encoder."):
+                    image_encoder_weights[".".join(key.split(".")[1:])] = value
+            self.image_encoder.load_state_dict(image_encoder_weights, strict=True)
+
+            self.image_encoder_type = ckpt["config"]["model"]["image_encoder"]["model_type"]
+            if self.freeze_backbone:
+                print("Freezing image encoder; training only the Prototype EDL head")
+                for param in self.image_encoder.parameters():
+                    param.requires_grad = False
+            in_features = self.image_encoder.out_dim
+
         self.proto_head = PrototypeEDLHead(
-            in_features=self.image_encoder.out_dim,
+            in_features=in_features,
             prototypes_per_class=prototypes_per_class,
             evidence_type=evidence_type,
             temperature=temperature,
@@ -163,6 +174,8 @@ class MammoPrototypeEDLModel(nn.Module):
         return self.image_encoder_type
 
     def encode_image(self, image):
+        if self.image_encoder is None:
+            return image
         if self.image_encoder_type == "cnn":
             input_dict = {"image": image, "breast_clip_train_mode": True}
             image_features, raw_features = self.image_encoder(input_dict)
@@ -184,6 +197,8 @@ class MammoPrototypeEDLModel(nn.Module):
         return self.proto_head(z)
 
     def forward(self, images):
+        if self.image_encoder is None:
+            return self.forward_from_embedding(images)
         z = self.encode_image(images)
         return self.forward_from_embedding(z)
 

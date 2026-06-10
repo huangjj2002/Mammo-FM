@@ -17,6 +17,10 @@ if "--help" in sys.argv or "-h" in sys.argv:
     _p.add_argument("--data-dir", default=r"G:\data", type=str)
     _p.add_argument("--img-dir", default="images_png", type=str)
     _p.add_argument("--csv-file", default="train_with_test_data.csv", type=str)
+    _p.add_argument("--input-mode", default="image", choices=["image", "embedding"], type=str)
+    _p.add_argument("--embedding-dir", default="./output/origin_embeddings_finetuned_fold0", type=str)
+    _p.add_argument("--embeddings-file", default="embeddings.npy", type=str)
+    _p.add_argument("--metadata-file", default="metadata.csv", type=str)
     _p.add_argument("--clip_chk_pt_path", default="./model/Mammo-FM_BatmanlabTrained_CLIP.tar", type=str)
     _p.add_argument("--model-save-dir", default="./best_model", type=str)
     _p.add_argument("--csv-output-dir", default="./output", type=str)
@@ -42,6 +46,7 @@ if "--help" in sys.argv or "-h" in sys.argv:
     _p.add_argument("--kfold0-val-max-frac", default=0.5, type=float)
     _p.add_argument("--epochs", default=10, type=int)
     _p.add_argument("--early-stop", default=5, type=int)
+    _p.add_argument("--early-stop-metric", default="auroc", choices=["auroc", "val_loss"])
     _p.add_argument("--batch-size", default=4, type=int)
     _p.add_argument("--micro-batch-size", default=1, type=int)
     _p.add_argument("--lr", default=5e-5, type=float)
@@ -94,7 +99,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.cluster import KMeans
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -327,7 +332,18 @@ def save_proto_component_curve(history_df, output_path, title):
         "train_proto_attract_loss",
         "train_proto_separation_loss",
         "train_proto_diversity_loss",
-        "val_loss",
+        "train_optim_total_loss",
+        "train_optim_edl_loss",
+        "train_optim_class_loss",
+        "train_optim_proto_reg_loss",
+        "val_total_loss",
+        "val_edl_loss",
+        "val_class_loss",
+        "val_proto_reg_loss",
+        "val_proto_reg_loss_raw",
+        "val_proto_attract_loss",
+        "val_proto_separation_loss",
+        "val_proto_diversity_loss",
     ]
     available_columns = [col for col in component_columns if col in history_df.columns]
     if not available_columns:
@@ -360,7 +376,18 @@ def save_all_proto_component_curves(history_df, output_path, title):
         "train_proto_attract_loss",
         "train_proto_separation_loss",
         "train_proto_diversity_loss",
-        "val_loss",
+        "train_optim_total_loss",
+        "train_optim_edl_loss",
+        "train_optim_class_loss",
+        "train_optim_proto_reg_loss",
+        "val_total_loss",
+        "val_edl_loss",
+        "val_class_loss",
+        "val_proto_reg_loss",
+        "val_proto_reg_loss_raw",
+        "val_proto_attract_loss",
+        "val_proto_separation_loss",
+        "val_proto_diversity_loss",
     ]
     available_columns = [col for col in component_columns if col in history_df.columns]
     if not available_columns:
@@ -403,6 +430,120 @@ def append_dir_suffix(path_obj, suffix):
     return path_obj.with_name(f"{path_obj.name}_{suffix}")
 
 
+class EmbeddingMammoDataset(Dataset):
+    def __init__(self, df, embeddings, label_col):
+        self.df = df.reset_index(drop=True)
+        self.embeddings = embeddings
+        self.label_col = label_col
+        if "embedding_row" not in self.df.columns:
+            self.df["embedding_row"] = np.arange(len(self.df), dtype=np.int64)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        embedding_row = int(row["embedding_row"])
+        return {
+            "x": torch.as_tensor(np.asarray(self.embeddings[embedding_row], dtype=np.float32)),
+            "y": torch.tensor(int(row[self.label_col]), dtype=torch.float32),
+            "embedding_row": embedding_row,
+        }
+
+
+def embedding_collate_fn(batch):
+    return {
+        "x": torch.stack([item["x"] for item in batch]).float(),
+        "y": torch.tensor([item["y"].item() for item in batch], dtype=torch.float32),
+        "embedding_row": [item["embedding_row"] for item in batch],
+    }
+
+
+def load_embedding_cache(embedding_dir, embeddings_file="embeddings.npy", metadata_file="metadata.csv"):
+    embedding_dir = Path(embedding_dir)
+    embeddings_path = embedding_dir / embeddings_file
+    metadata_path = embedding_dir / metadata_file
+    manifest_path = embedding_dir / "manifest.json"
+    if not embeddings_path.exists():
+        raise FileNotFoundError(f"Missing embeddings file: {embeddings_path}")
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Missing metadata file: {metadata_path}")
+    embeddings = np.load(embeddings_path, mmap_mode="r")
+    metadata = read_mammo_csv(metadata_path)
+    if "embedding_row" not in metadata.columns:
+        metadata.insert(0, "embedding_row", np.arange(len(metadata), dtype=np.int64))
+    metadata["embedding_row"] = pd.to_numeric(metadata["embedding_row"], errors="raise").astype(int)
+    if len(metadata) != int(embeddings.shape[0]):
+        raise ValueError(
+            f"metadata rows ({len(metadata)}) != embeddings rows ({embeddings.shape[0]})."
+        )
+    manifest = {}
+    if manifest_path.exists():
+        import json
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return embeddings, metadata, manifest, embeddings_path, metadata_path
+
+
+def is_embedding_mode(args):
+    return str(getattr(args, "input_mode", "image")).strip().lower() == "embedding"
+
+
+def make_proto_dataset(df, args, transform=None):
+    if is_embedding_mode(args):
+        return EmbeddingMammoDataset(df, args.embedding_array, args.label)
+    return CustomMammoDataset(
+        df,
+        args.img_dir,
+        label_col=args.label,
+        transform=transform,
+        mean=args.mean,
+        std=args.std,
+    )
+
+
+def make_proto_loader(dataset, args, shuffle):
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=shuffle,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False,
+        collate_fn=embedding_collate_fn if is_embedding_mode(args) else collate_fn,
+    )
+
+
+def batch_to_model_input(data, args, device):
+    inputs = data["x"].to(device, non_blocking=True)
+    if is_embedding_mode(args):
+        return inputs.float().contiguous()
+    return inputs.squeeze(1).permute(0, 3, 1, 2).contiguous()
+
+
+def build_proto_model(args, base_ckpt=None):
+    if is_embedding_mode(args):
+        return MammoPrototypeEDLModel(
+            args,
+            ckpt=None,
+            num_classes=args.num_classes,
+            evidence_type=args.evidence_type,
+            prototypes_per_class=args.edl_proto_k,
+            temperature=args.edl_proto_temperature,
+            normalize_embeddings=args.edl_proto_normalize,
+            feature_dim=args.feature_dim,
+        )
+    return MammoPrototypeEDLModel(
+        args,
+        ckpt=base_ckpt,
+        num_classes=args.num_classes,
+        evidence_type=args.evidence_type,
+        prototypes_per_class=args.edl_proto_k,
+        temperature=args.edl_proto_temperature,
+        normalize_embeddings=args.edl_proto_normalize,
+    )
+
+
 def extract_proto_topk(model_outputs, topk):
     proto_evidence = model_outputs["prototype_evidence"]
     proto_similarity = model_outputs["prototype_similarities"]
@@ -419,6 +560,20 @@ def extract_proto_topk(model_outputs, topk):
 
 @torch.no_grad()
 def collect_training_embeddings(model, train_df, img_dir, args, device):
+    if is_embedding_mode(args):
+        rows = train_df["embedding_row"].astype(int).to_numpy()
+        embeddings = np.asarray(args.embedding_array[rows], dtype=np.float32)
+        labels = train_df[args.label].astype(int).to_numpy()
+        if model.proto_head.normalize_embeddings:
+            embedding_tensor = F.normalize(
+                torch.from_numpy(embeddings).float(),
+                p=2,
+                dim=-1,
+                eps=1e-12,
+            )
+            embeddings = embedding_tensor.numpy()
+        return embeddings, labels
+
     dataset = CustomMammoDataset(
         train_df,
         img_dir,
@@ -444,7 +599,7 @@ def collect_training_embeddings(model, train_df, img_dir, args, device):
     model.eval()
 
     for data in tqdm(loader, desc="[Proto Init] collect embeddings"):
-        inputs = data["x"].to(device, non_blocking=True).squeeze(1).permute(0, 3, 1, 2).contiguous()
+        inputs = batch_to_model_input(data, args, device)
         labels_batch = data["y"]
         bs = inputs.size(0)
         for mb_start in range(0, bs, micro_batch_size):
@@ -526,7 +681,7 @@ def train_epoch_proto(model, loader, criterion, optimizer, scheduler, scaler, ep
         criterion.set_epoch(epoch)
 
     for step, data in enumerate(tqdm(loader, desc=f"[Epoch {epoch+1}/{total_epochs} train]")):
-        inputs = data["x"].to(device, non_blocking=True).squeeze(1).permute(0, 3, 1, 2).contiguous()
+        inputs = batch_to_model_input(data, args, device)
         labels = data["y"].to(device, non_blocking=True)
         bs = inputs.size(0)
         labels_onehot = labels_to_onehot(labels, num_classes=num_classes, device=device)
@@ -600,7 +755,14 @@ def train_epoch_proto(model, loader, criterion, optimizer, scheduler, scaler, ep
 @torch.no_grad()
 def valid_epoch_proto(model, loader, criterion, epoch, total_epochs, args, device):
     model.eval()
-    losses = AverageMeter()
+    total_losses = AverageMeter()
+    edl_losses = AverageMeter()
+    class_losses = AverageMeter()
+    proto_reg_losses = AverageMeter()
+    proto_reg_raw_losses = AverageMeter()
+    proto_attract_losses = AverageMeter()
+    proto_separation_losses = AverageMeter()
+    proto_diversity_losses = AverageMeter()
     all_probs = []
     all_evidence = []
     all_alpha = []
@@ -613,7 +775,7 @@ def valid_epoch_proto(model, loader, criterion, epoch, total_epochs, args, devic
         criterion.set_epoch(epoch)
 
     for data in tqdm(loader, desc=f"[Epoch {epoch+1}/{total_epochs} valid]"):
-        inputs = data["x"].to(device, non_blocking=True).squeeze(1).permute(0, 3, 1, 2).contiguous()
+        inputs = batch_to_model_input(data, args, device)
         labels = data["y"].to(device, non_blocking=True)
         bs = inputs.size(0)
         labels_onehot = labels_to_onehot(labels, num_classes=num_classes, device=device)
@@ -627,9 +789,20 @@ def valid_epoch_proto(model, loader, criterion, epoch, total_epochs, args, devic
             with torch.cuda.amp.autocast(enabled=amp_enabled):
                 outputs = model(mb_inputs)
                 loss_terms = criterion(outputs["alpha"], mb_labels_onehot)
-                loss = loss_terms["total_loss"]
+                target_indices = torch.argmax(mb_labels_onehot, dim=1).long()
+                proto_terms = args.prototype_regularizer(outputs, model.proto_head, target_indices)
+                proto_loss_raw = proto_terms.get("raw_total_loss", proto_terms["total_loss"])
+                proto_loss = args.edl_proto_loss_weight * proto_loss_raw
+                total_loss = loss_terms["total_loss"] + proto_loss
 
-            losses.update(loss.item(), mb_size)
+            total_losses.update(total_loss.item(), mb_size)
+            edl_losses.update(loss_terms["edl_loss"].item(), mb_size)
+            class_losses.update(loss_terms["class_loss"].item(), mb_size)
+            proto_reg_losses.update(proto_loss.item(), mb_size)
+            proto_reg_raw_losses.update(proto_loss_raw.item(), mb_size)
+            proto_attract_losses.update(proto_terms["attract_loss"].item(), mb_size)
+            proto_separation_losses.update(proto_terms["separation_loss"].item(), mb_size)
+            proto_diversity_losses.update(proto_terms["diversity_loss"].item(), mb_size)
             all_probs.append(outputs["probability"].detach().cpu().numpy())
             all_evidence.append(outputs["evidence"].detach().cpu().numpy())
             all_alpha.append(outputs["alpha"].detach().cpu().numpy())
@@ -639,7 +812,16 @@ def valid_epoch_proto(model, loader, criterion, epoch, total_epochs, args, devic
         raise ValueError("Validation loader produced no batches.")
 
     return (
-        losses.avg,
+        {
+            "total_loss": total_losses.avg,
+            "edl_loss": edl_losses.avg,
+            "class_loss": class_losses.avg,
+            "proto_reg_loss": proto_reg_losses.avg,
+            "proto_reg_loss_raw": proto_reg_raw_losses.avg,
+            "proto_attract_loss": proto_attract_losses.avg,
+            "proto_separation_loss": proto_separation_losses.avg,
+            "proto_diversity_loss": proto_diversity_losses.avg,
+        },
         np.concatenate(all_probs),
         np.concatenate(all_evidence),
         np.concatenate(all_alpha),
@@ -649,29 +831,18 @@ def valid_epoch_proto(model, loader, criterion, epoch, total_epochs, args, devic
 
 @torch.no_grad()
 def predict_all_proto(model_paths, df_all, img_dir, args, device, threshold=None):
-    base_ckpt = torch.load(args.clip_chk_pt_path, map_location="cpu", weights_only=False)
-    if base_ckpt["config"]["model"]["image_encoder"]["model_type"] == "cnn":
-        args.image_encoder_type = base_ckpt["config"]["model"]["image_encoder"]["name"]
+    if is_embedding_mode(args):
+        base_ckpt = None
+        args.image_encoder_type = "embedding"
     else:
-        args.image_encoder_type = base_ckpt["config"]["model"]["image_encoder"]["model_type"]
+        base_ckpt = torch.load(args.clip_chk_pt_path, map_location="cpu", weights_only=False)
+        if base_ckpt["config"]["model"]["image_encoder"]["model_type"] == "cnn":
+            args.image_encoder_type = base_ckpt["config"]["model"]["image_encoder"]["name"]
+        else:
+            args.image_encoder_type = base_ckpt["config"]["model"]["image_encoder"]["model_type"]
 
-    dataset = CustomMammoDataset(
-        df_all,
-        img_dir,
-        label_col=args.label,
-        transform=None,
-        mean=args.mean,
-        std=args.std,
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=False,
-        collate_fn=collate_fn,
-    )
+    dataset = make_proto_dataset(df_all, args, transform=None)
+    loader = make_proto_loader(dataset, args, shuffle=False)
 
     num_classes = getattr(args, "num_classes", 2)
     micro_batch_size = max(1, int(getattr(args, "micro_batch_size", args.batch_size)))
@@ -693,15 +864,7 @@ def predict_all_proto(model_paths, df_all, img_dir, args, device, threshold=None
             fold_idx, ckpt_path = model_idx, model_item
 
         print(f"[Predict] Loading fold {fold_idx} model: {ckpt_path}")
-        model = MammoPrototypeEDLModel(
-            args,
-            ckpt=base_ckpt,
-            num_classes=num_classes,
-            evidence_type=args.evidence_type,
-            prototypes_per_class=args.edl_proto_k,
-            temperature=args.edl_proto_temperature,
-            normalize_embeddings=args.edl_proto_normalize,
-        )
+        model = build_proto_model(args, base_ckpt=base_ckpt)
         state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         model.load_state_dict(state["model"], strict=True)
         model = model.to(device)
@@ -717,7 +880,7 @@ def predict_all_proto(model_paths, df_all, img_dir, args, device, threshold=None
         actual_topk = None
 
         for data in tqdm(loader, desc=f"[Predict] fold {fold_idx}"):
-            inputs = data["x"].to(device, non_blocking=True).squeeze(1).permute(0, 3, 1, 2).contiguous()
+            inputs = batch_to_model_input(data, args, device)
             bs = inputs.size(0)
             for mb_start in range(0, bs, micro_batch_size):
                 mb_end = min(mb_start + micro_batch_size, bs)
@@ -867,6 +1030,10 @@ def main(args=None):
         parser.add_argument("--data-dir", default=r"G:\data", type=str)
         parser.add_argument("--img-dir", default="images_png", type=str)
         parser.add_argument("--csv-file", default="train_with_test_data.csv", type=str)
+        parser.add_argument("--input-mode", default="image", choices=["image", "embedding"], type=str)
+        parser.add_argument("--embedding-dir", default="./output/origin_embeddings_finetuned_fold0", type=str)
+        parser.add_argument("--embeddings-file", default="embeddings.npy", type=str)
+        parser.add_argument("--metadata-file", default="metadata.csv", type=str)
         parser.add_argument("--clip_chk_pt_path", default="./model/Mammo-FM_BatmanlabTrained_CLIP.tar", type=str)
         parser.add_argument("--model-save-dir", default=None, type=str)
         parser.add_argument("--csv-output-dir", default=None, type=str)
@@ -892,6 +1059,7 @@ def main(args=None):
         parser.add_argument("--kfold0-val-max-frac", default=0.5, type=float)
         parser.add_argument("--epochs", default=10, type=int)
         parser.add_argument("--early-stop", default=5, type=int)
+        parser.add_argument("--early-stop-metric", default="auroc", choices=["auroc", "val_loss"])
         parser.add_argument("--batch-size", default=4, type=int)
         parser.add_argument("--micro-batch-size", default=1, type=int)
         parser.add_argument("--lr", default=5e-5, type=float)
@@ -931,6 +1099,9 @@ def main(args=None):
         args = parser.parse_args()
 
     args.num_classes = 2
+    args.input_mode = str(getattr(args, "input_mode", "image")).strip().lower()
+    if args.input_mode not in {"image", "embedding"}:
+        raise ValueError(f"input_mode must be image or embedding, got {args.input_mode!r}")
     freeze_backbone = getattr(args, "freeze_backbone", False)
     if isinstance(freeze_backbone, str):
         freeze_backbone = freeze_backbone.lower() in {"1", "true", "t", "yes", "y"}
@@ -1003,22 +1174,44 @@ def main(args=None):
             f"Clamping topk to {args.edl_proto_k}."
         )
         args.edl_proto_topk = args.edl_proto_k
+    args.early_stop_metric = str(getattr(args, "early_stop_metric", "auroc")).strip().lower()
+    if args.early_stop_metric not in {"auroc", "val_loss"}:
+        raise ValueError("early_stop_metric must be 'auroc' or 'val_loss'.")
 
     gpu_id = int(getattr(args, "gpu_id", 0))
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
-    data_dir = resolve_project_path(args.data_dir)
-    args.data_dir = data_dir
-    if Path(args.img_dir).is_absolute() or os.path.isabs(str(args.img_dir)):
-        args.img_dir = Path(args.img_dir)
+    if is_embedding_mode(args):
+        args.embedding_dir = resolve_project_path(
+            getattr(args, "embedding_dir", "./output/origin_embeddings_finetuned_fold0")
+        )
+        args.embeddings_file = getattr(args, "embeddings_file", "embeddings.npy")
+        args.metadata_file = getattr(args, "metadata_file", "metadata.csv")
+        (
+            args.embedding_array,
+            args.embedding_metadata,
+            args.embedding_manifest,
+            args.embeddings_path,
+            args.metadata_path,
+        ) = load_embedding_cache(args.embedding_dir, args.embeddings_file, args.metadata_file)
+        args.feature_dim = int(args.embedding_array.shape[1])
+        args.data_dir = args.embedding_dir
+        args.img_dir = None
+        args.data_csv = args.metadata_path
+        args.image_encoder_type = "embedding"
     else:
-        args.img_dir = data_dir / args.img_dir
+        data_dir = resolve_project_path(args.data_dir)
+        args.data_dir = data_dir
+        if Path(args.img_dir).is_absolute() or os.path.isabs(str(args.img_dir)):
+            args.img_dir = Path(args.img_dir)
+        else:
+            args.img_dir = data_dir / args.img_dir
 
-    if Path(args.csv_file).is_absolute() or os.path.isabs(str(args.csv_file)):
-        args.data_csv = Path(args.csv_file)
-    else:
-        args.data_csv = data_dir / args.csv_file
-    args.clip_chk_pt_path = resolve_project_path(args.clip_chk_pt_path)
+        if Path(args.csv_file).is_absolute() or os.path.isabs(str(args.csv_file)):
+            args.data_csv = Path(args.csv_file)
+        else:
+            args.data_csv = data_dir / args.csv_file
+        args.clip_chk_pt_path = resolve_project_path(args.clip_chk_pt_path)
 
     output_arg = getattr(args, "output_dir", None)
     model_save_arg = getattr(args, "model_save_dir", None)
@@ -1056,9 +1249,15 @@ def main(args=None):
     print(f"Device: {device}")
     print(f"Model Save Dir: {model_save_dir}")
     print(f"CSV Output Dir: {csv_output_dir}")
+    print(f"Input Mode: {args.input_mode}")
     print(f"Data CSV: {args.data_csv}")
-    print(f"Image dir: {args.img_dir}")
-    print(f"Checkpoint: {args.clip_chk_pt_path}")
+    if is_embedding_mode(args):
+        print(f"Embedding Dir: {args.embedding_dir}")
+        print(f"Embeddings: {args.embeddings_path}")
+        print(f"Embedding Dim: {args.feature_dim}")
+    else:
+        print(f"Image dir: {args.img_dir}")
+        print(f"Checkpoint: {args.clip_chk_pt_path}")
     print(f"Arch: {args.arch}  |  Folds: {args.n_folds}  |  EarlyStop: {args.early_stop}")
     print(f"Freeze Backbone: {args.freeze_backbone}")
     print(f"Epochs(max): {args.epochs}  |  Batch: {args.batch_size}  |  LR: {args.lr}")
@@ -1122,11 +1321,15 @@ def main(args=None):
         )
     df = read_mammo_csv(folds_csv)
 
-    base_ckpt = torch.load(args.clip_chk_pt_path, map_location="cpu", weights_only=False)
-    if base_ckpt["config"]["model"]["image_encoder"]["model_type"] == "cnn":
-        args.image_encoder_type = base_ckpt["config"]["model"]["image_encoder"]["name"]
+    if is_embedding_mode(args):
+        base_ckpt = None
+        args.image_encoder_type = "embedding"
     else:
-        args.image_encoder_type = base_ckpt["config"]["model"]["image_encoder"]["model_type"]
+        base_ckpt = torch.load(args.clip_chk_pt_path, map_location="cpu", weights_only=False)
+        if base_ckpt["config"]["model"]["image_encoder"]["model_type"] == "cnn":
+            args.image_encoder_type = base_ckpt["config"]["model"]["image_encoder"]["name"]
+        else:
+            args.image_encoder_type = base_ckpt["config"]["model"]["image_encoder"]["model_type"]
 
     fold_model_paths = []
     oof_parts = []
@@ -1170,61 +1373,29 @@ def main(args=None):
         if n_valid_classes < 2:
             print(f"  WARNING: {eval_split_name.title()} set for fold {fold} has only {n_valid_classes} class(es).")
 
-        train_transform = get_train_transform(tuple(args.img_size), args.alpha, args.sigma, args.p)
-        val_transform = get_val_transform(tuple(args.img_size))
-
-        train_ds = CustomMammoDataset(
-            train_df,
-            args.img_dir,
-            label_col=args.label,
-            transform=train_transform,
-            mean=args.mean,
-            std=args.std,
-        )
-        valid_ds = CustomMammoDataset(
-            valid_df,
-            args.img_dir,
-            label_col=args.label,
-            transform=val_transform,
-            mean=args.mean,
-            std=args.std,
-        )
+        if is_embedding_mode(args):
+            train_ds = make_proto_dataset(train_df, args, transform=None)
+            train_eval_ds = make_proto_dataset(train_df, args, transform=None)
+            valid_ds = make_proto_dataset(valid_df, args, transform=None)
+        else:
+            train_transform = get_train_transform(tuple(args.img_size), args.alpha, args.sigma, args.p)
+            val_transform = get_val_transform(tuple(args.img_size))
+            train_ds = make_proto_dataset(train_df, args, transform=train_transform)
+            train_eval_ds = make_proto_dataset(train_df, args, transform=val_transform)
+            valid_ds = make_proto_dataset(valid_df, args, transform=val_transform)
 
         if len(train_ds) == 0 or len(valid_ds) == 0:
             print(f"  WARNING: Fold {fold} has empty train or valid data; skipping.")
             continue
 
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            drop_last=False,
-            collate_fn=collate_fn,
-        )
-        valid_loader = DataLoader(
-            valid_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            drop_last=False,
-            collate_fn=collate_fn,
-        )
-        if len(train_loader) == 0 or len(valid_loader) == 0:
+        train_loader = make_proto_loader(train_ds, args, shuffle=True)
+        train_eval_loader = make_proto_loader(train_eval_ds, args, shuffle=False)
+        valid_loader = make_proto_loader(valid_ds, args, shuffle=False)
+        if len(train_loader) == 0 or len(train_eval_loader) == 0 or len(valid_loader) == 0:
             print(f"  WARNING: Fold {fold} produced no train or valid batches; skipping.")
             continue
 
-        model = MammoPrototypeEDLModel(
-            args,
-            ckpt=base_ckpt,
-            num_classes=args.num_classes,
-            evidence_type=args.evidence_type,
-            prototypes_per_class=args.edl_proto_k,
-            temperature=args.edl_proto_temperature,
-            normalize_embeddings=args.edl_proto_normalize,
-        )
+        model = build_proto_model(args, base_ckpt=base_ckpt)
         model = model.to(device)
         try:
             initialize_fold_prototypes(model, train_df, args.img_dir, args, device, fold)
@@ -1243,7 +1414,10 @@ def main(args=None):
             raise RuntimeError("No trainable parameters found. Check freeze_backbone/model setup.")
         trainable_count = sum(p.numel() for p in trainable_params)
         total_count = sum(p.numel() for p in model.parameters())
-        backbone_count = sum(p.numel() for p in model.image_encoder.parameters() if p.requires_grad)
+        if getattr(model, "image_encoder", None) is None:
+            backbone_count = 0
+        else:
+            backbone_count = sum(p.numel() for p in model.image_encoder.parameters() if p.requires_grad)
         head_count = sum(p.numel() for p in model.proto_head.parameters() if p.requires_grad)
         print(f"Trainable params: {trainable_count:,} / {total_count:,}")
         print(f"  Trainable backbone params: {backbone_count:,}")
@@ -1273,6 +1447,7 @@ def main(args=None):
 
         logger = SummaryWriter(log_dir / f"fold{fold}")
         early_stopper = EarlyStopping(patience=args.early_stop) if args.early_stop > 0 else None
+        best_score = -float("inf")
         best_auroc = -float("inf")
         best_model_path = ckpt_dir / f"best_fold{fold}_seed{args.seed}_proto_edl.pth"
         saved_best = False
@@ -1308,7 +1483,16 @@ def main(args=None):
                     device,
                 )
 
-                val_loss, predictions, evidences, alphas, uncertainties = valid_epoch_proto(
+                train_eval_metrics, _, _, _, _ = valid_epoch_proto(
+                    model,
+                    train_eval_loader,
+                    criterion,
+                    epoch,
+                    args.epochs,
+                    args,
+                    device,
+                )
+                val_metrics, predictions, evidences, alphas, uncertainties = valid_epoch_proto(
                     model,
                     valid_loader,
                     criterion,
@@ -1317,6 +1501,7 @@ def main(args=None):
                     args,
                     device,
                 )
+                val_loss = val_metrics["total_loss"]
                 last_predictions = predictions.copy()
                 last_evidences = evidences.copy()
                 last_alphas = alphas.copy()
@@ -1344,27 +1529,58 @@ def main(args=None):
                     annealing_step=args.annealing_step,
                     annealing_start_frac=args.annealing_start_frac,
                 )
-                is_best_epoch = metrics["AUROC"] > best_auroc
+                monitor_value = float(val_loss) if args.early_stop_metric == "val_loss" else float(metrics["AUROC"])
+                monitor_score = -monitor_value if args.early_stop_metric == "val_loss" else monitor_value
+                is_best_epoch = monitor_score > best_score
                 fold_history_rows.append(
                     {
                         "fold": fold,
                         "epoch": epoch + 1,
                         "eval_split": eval_split_name,
-                        "train_loss": float(train_metrics["total_loss"]),
-                        "train_total_loss": float(train_metrics["total_loss"]),
-                        "train_edl_loss": float(train_metrics["edl_loss"]),
-                        "train_class_loss": float(train_metrics["class_loss"]),
-                        "train_proto_reg_loss": float(train_metrics["proto_reg_loss"]),
-                        "train_proto_reg_loss_raw": float(train_metrics["proto_reg_loss_raw"]),
-                        "train_proto_attract_loss": float(train_metrics["proto_attract_loss"]),
-                        "train_proto_separation_loss": float(train_metrics["proto_separation_loss"]),
-                        "train_proto_diversity_loss": float(train_metrics["proto_diversity_loss"]),
+                        "train_loss": float(train_eval_metrics["total_loss"]),
+                        "train_total_loss": float(train_eval_metrics["total_loss"]),
+                        "train_edl_loss": float(train_eval_metrics["edl_loss"]),
+                        "train_class_loss": float(train_eval_metrics["class_loss"]),
+                        "train_proto_reg_loss": float(train_eval_metrics["proto_reg_loss"]),
+                        "train_proto_reg_loss_raw": float(train_eval_metrics["proto_reg_loss_raw"]),
+                        "train_proto_attract_loss": float(train_eval_metrics["proto_attract_loss"]),
+                        "train_proto_separation_loss": float(train_eval_metrics["proto_separation_loss"]),
+                        "train_proto_diversity_loss": float(train_eval_metrics["proto_diversity_loss"]),
+                        "train_eval_loss": float(train_eval_metrics["total_loss"]),
+                        "train_eval_total_loss": float(train_eval_metrics["total_loss"]),
+                        "train_eval_edl_loss": float(train_eval_metrics["edl_loss"]),
+                        "train_eval_class_loss": float(train_eval_metrics["class_loss"]),
+                        "train_eval_proto_reg_loss": float(train_eval_metrics["proto_reg_loss"]),
+                        "train_eval_proto_reg_loss_raw": float(train_eval_metrics["proto_reg_loss_raw"]),
+                        "train_eval_proto_attract_loss": float(train_eval_metrics["proto_attract_loss"]),
+                        "train_eval_proto_separation_loss": float(train_eval_metrics["proto_separation_loss"]),
+                        "train_eval_proto_diversity_loss": float(train_eval_metrics["proto_diversity_loss"]),
+                        "train_optim_loss": float(train_metrics["total_loss"]),
+                        "train_optim_total_loss": float(train_metrics["total_loss"]),
+                        "train_optim_edl_loss": float(train_metrics["edl_loss"]),
+                        "train_optim_class_loss": float(train_metrics["class_loss"]),
+                        "train_optim_proto_reg_loss": float(train_metrics["proto_reg_loss"]),
+                        "train_optim_proto_reg_loss_raw": float(train_metrics["proto_reg_loss_raw"]),
+                        "train_optim_proto_attract_loss": float(train_metrics["proto_attract_loss"]),
+                        "train_optim_proto_separation_loss": float(train_metrics["proto_separation_loss"]),
+                        "train_optim_proto_diversity_loss": float(train_metrics["proto_diversity_loss"]),
                         "edl_proto_loss_weight": float(args.edl_proto_loss_weight),
                         "val_loss": float(val_loss),
+                        "val_total_loss": float(val_metrics["total_loss"]),
+                        "val_edl_loss": float(val_metrics["edl_loss"]),
+                        "val_class_loss": float(val_metrics["class_loss"]),
+                        "val_proto_reg_loss": float(val_metrics["proto_reg_loss"]),
+                        "val_proto_reg_loss_raw": float(val_metrics["proto_reg_loss_raw"]),
+                        "val_proto_attract_loss": float(val_metrics["proto_attract_loss"]),
+                        "val_proto_separation_loss": float(val_metrics["proto_separation_loss"]),
+                        "val_proto_diversity_loss": float(val_metrics["proto_diversity_loss"]),
                         "eval_loss": float(val_loss),
                         "auroc": float(metrics["AUROC"]),
                         "auprc": float(metrics["AUPRC"]),
                         "bacc": float(metrics["bACC"]),
+                        "early_stop_metric": args.early_stop_metric,
+                        "monitor_value": float(monitor_value),
+                        "monitor_score": float(monitor_score),
                         "mean_uncertainty": mean_uncertainty,
                         "edl_annealing_value": float(annealing_value),
                         "annealing_complete": int(annealing_complete),
@@ -1375,10 +1591,14 @@ def main(args=None):
                 )
 
                 print(
-                    f"Fold {fold} Epoch {epoch+1} - train_loss: {train_metrics['total_loss']:.4f}  "
-                    f"proto: {train_metrics['proto_reg_loss']:.4f}  "
-                    f"proto_raw: {train_metrics['proto_reg_loss_raw']:.4f}  "
-                    f"{eval_split_name}_loss: {val_loss:.4f}  AUROC: {metrics['AUROC']:.4f}  "
+                    f"Fold {fold} Epoch {epoch+1} - train_eval_loss: {train_eval_metrics['total_loss']:.4f}  "
+                    f"train_optim_loss: {train_metrics['total_loss']:.4f}  "
+                    f"train_eval_edl: {train_eval_metrics['edl_loss']:.4f}  "
+                    f"train_eval_proto: {train_eval_metrics['proto_reg_loss']:.4f}  "
+                    f"{eval_split_name}_loss: {val_loss:.4f}  "
+                    f"{eval_split_name}_edl: {val_metrics['edl_loss']:.4f}  "
+                    f"{eval_split_name}_proto: {val_metrics['proto_reg_loss']:.4f}  "
+                    f"AUROC: {metrics['AUROC']:.4f}  "
                     f"AUPRC: {metrics['AUPRC']:.4f}  bACC: {metrics['bACC']:.4f}  time: {elapsed:.0f}s"
                 )
 
@@ -1392,6 +1612,22 @@ def main(args=None):
                 logger.add_scalar("train/epoch_proto_diversity_loss", train_metrics["proto_diversity_loss"], epoch + 1)
                 logger.add_scalar("train/edl_proto_loss_weight", args.edl_proto_loss_weight, epoch + 1)
                 logger.add_scalar("train/edl_annealing_value", annealing_value, epoch + 1)
+                logger.add_scalar("train_eval/epoch_total_loss", train_eval_metrics["total_loss"], epoch + 1)
+                logger.add_scalar("train_eval/epoch_edl_loss", train_eval_metrics["edl_loss"], epoch + 1)
+                logger.add_scalar("train_eval/epoch_class_loss", train_eval_metrics["class_loss"], epoch + 1)
+                logger.add_scalar("train_eval/epoch_proto_reg_loss", train_eval_metrics["proto_reg_loss"], epoch + 1)
+                logger.add_scalar("train_eval/epoch_proto_reg_loss_raw", train_eval_metrics["proto_reg_loss_raw"], epoch + 1)
+                logger.add_scalar("train_eval/epoch_proto_attract_loss", train_eval_metrics["proto_attract_loss"], epoch + 1)
+                logger.add_scalar("train_eval/epoch_proto_separation_loss", train_eval_metrics["proto_separation_loss"], epoch + 1)
+                logger.add_scalar("train_eval/epoch_proto_diversity_loss", train_eval_metrics["proto_diversity_loss"], epoch + 1)
+                logger.add_scalar(f"{eval_split_name}/epoch_total_loss", val_metrics["total_loss"], epoch + 1)
+                logger.add_scalar(f"{eval_split_name}/epoch_edl_loss", val_metrics["edl_loss"], epoch + 1)
+                logger.add_scalar(f"{eval_split_name}/epoch_class_loss", val_metrics["class_loss"], epoch + 1)
+                logger.add_scalar(f"{eval_split_name}/epoch_proto_reg_loss", val_metrics["proto_reg_loss"], epoch + 1)
+                logger.add_scalar(f"{eval_split_name}/epoch_proto_reg_loss_raw", val_metrics["proto_reg_loss_raw"], epoch + 1)
+                logger.add_scalar(f"{eval_split_name}/epoch_proto_attract_loss", val_metrics["proto_attract_loss"], epoch + 1)
+                logger.add_scalar(f"{eval_split_name}/epoch_proto_separation_loss", val_metrics["proto_separation_loss"], epoch + 1)
+                logger.add_scalar(f"{eval_split_name}/epoch_proto_diversity_loss", val_metrics["proto_diversity_loss"], epoch + 1)
                 logger.add_scalar(f"{eval_split_name}/AUROC", metrics["AUROC"], epoch + 1)
                 logger.add_scalar(f"{eval_split_name}/AUPRC", metrics["AUPRC"], epoch + 1)
                 logger.add_scalar(f"{eval_split_name}/bACC", metrics["bACC"], epoch + 1)
@@ -1399,6 +1635,7 @@ def main(args=None):
                 logger.add_scalar(f"{eval_split_name}/mean_uncertainty", mean_uncertainty, epoch + 1)
 
                 if is_best_epoch:
+                    best_score = monitor_score
                     best_auroc = metrics["AUROC"]
                     best_predictions = predictions.copy()
                     best_evidences = evidences.copy()
@@ -1410,8 +1647,14 @@ def main(args=None):
                             "epoch": epoch,
                             "model": model.state_dict(),
                             "auroc": best_auroc,
+                            "best_score": best_score,
+                            "best_metric": args.early_stop_metric,
+                            "best_metric_value": monitor_value,
                             "metrics": metrics,
                             "prototype_config": {
+                                "input_mode": args.input_mode,
+                                "feature_dim": getattr(args, "feature_dim", None),
+                                "embedding_dir": str(getattr(args, "embedding_dir", "")),
                                 "edl_proto_k": args.edl_proto_k,
                                 "edl_proto_topk": args.edl_proto_topk,
                                 "edl_proto_temperature": args.edl_proto_temperature,
@@ -1428,12 +1671,24 @@ def main(args=None):
                         best_model_path,
                     )
                     saved_best = True
-                    print(f"  -> Saved best (AUROC={best_auroc:.4f})")
+                    print(
+                        f"  -> Saved best ({args.early_stop_metric}={monitor_value:.4f}, "
+                        f"AUROC={best_auroc:.4f})"
+                    )
 
                 if early_stopper is not None:
-                    if annealing_complete:
-                        if early_stopper(metrics["AUROC"]):
-                            print(f"  -> Early stopping at epoch {epoch+1} (best AUROC={early_stopper.best_score:.4f})")
+                    should_check_early_stop = annealing_complete or args.early_stop_metric == "val_loss"
+                    if should_check_early_stop:
+                        if early_stopper(monitor_score):
+                            best_value = (
+                                -early_stopper.best_score
+                                if args.early_stop_metric == "val_loss"
+                                else early_stopper.best_score
+                            )
+                            print(
+                                f"  -> Early stopping at epoch {epoch+1} "
+                                f"(best {args.early_stop_metric}={best_value:.4f})"
+                            )
                             break
                     else:
                         print(
@@ -1453,8 +1708,13 @@ def main(args=None):
                         "epoch": last_epoch,
                         "model": model.state_dict(),
                         "auroc": best_auroc,
+                        "best_score": best_score,
+                        "best_metric": args.early_stop_metric,
                         "metrics": best_metrics,
                         "prototype_config": {
+                            "input_mode": args.input_mode,
+                            "feature_dim": getattr(args, "feature_dim", None),
+                            "embedding_dir": str(getattr(args, "embedding_dir", "")),
                             "edl_proto_k": args.edl_proto_k,
                             "edl_proto_topk": args.edl_proto_topk,
                             "edl_proto_temperature": args.edl_proto_temperature,
@@ -1485,6 +1745,9 @@ def main(args=None):
                             "auroc": -1.0,
                             "metrics": {},
                             "prototype_config": {
+                                "input_mode": args.input_mode,
+                                "feature_dim": getattr(args, "feature_dim", None),
+                                "embedding_dir": str(getattr(args, "embedding_dir", "")),
                                 "edl_proto_k": args.edl_proto_k,
                                 "edl_proto_topk": args.edl_proto_topk,
                                 "edl_proto_temperature": args.edl_proto_temperature,
