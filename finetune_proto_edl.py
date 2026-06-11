@@ -430,6 +430,58 @@ def append_dir_suffix(path_obj, suffix):
     return path_obj.with_name(f"{path_obj.name}_{suffix}")
 
 
+def save_loss_curve(history_df, output_path, title):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(13.66, 7.68))
+    ax.plot(history_df["epoch"], history_df["train_loss"], color="#1f77b4", linewidth=2.5, label="train loss")
+    ax.plot(history_df["epoch"], history_df["val_loss"], color="#d62728", linewidth=2.5, label="val loss")
+    ax.set_xlabel("epoch", fontsize=14)
+    ax.set_ylabel("loss", fontsize=14)
+    ax.set_title(title, fontsize=16)
+    ax.grid(True, linestyle="-", alpha=0.3)
+    ax.legend(loc="upper right", fontsize=13)
+    ax.tick_params(axis="both", labelsize=12)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=100)
+    plt.close(fig)
+
+
+def save_all_folds_loss_curve(history_df, output_path, title):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    folds = sorted(history_df["fold"].unique().tolist())
+    if not folds:
+        return
+
+    ncols = 2 if len(folds) > 1 else 1
+    nrows = math.ceil(len(folds) / ncols)
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(8 * ncols, 4.5 * nrows), squeeze=False)
+    axes_flat = axes.flatten()
+
+    for ax, fold in zip(axes_flat, folds):
+        fold_df = history_df[history_df["fold"] == fold].sort_values("epoch")
+        ax.plot(fold_df["epoch"], fold_df["train_loss"], color="#1f77b4", linewidth=2.5, label="train loss")
+        ax.plot(fold_df["epoch"], fold_df["val_loss"], color="#d62728", linewidth=2.5, label="val loss")
+        ax.set_title(f"Fold {fold}")
+        ax.set_xlabel("epoch")
+        ax.set_ylabel("loss")
+        ax.grid(True, linestyle="-", alpha=0.3)
+        ax.legend(loc="upper right")
+
+    for ax in axes_flat[len(folds):]:
+        ax.axis("off")
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=100)
+    plt.close(fig)
+
+
 class EmbeddingMammoDataset(Dataset):
     def __init__(self, df, embeddings, label_col):
         self.df = df.reset_index(drop=True)
@@ -1773,7 +1825,7 @@ def main(args=None):
             history_png = output_dir / f"{data_stem}_fold{fold}_loss_curve_proto_edl.png"
             history_component_png = output_dir / f"{data_stem}_fold{fold}_loss_components_proto_edl.png"
             history_df.to_csv(history_csv, index=False)
-            save_loss_curve(history_df, history_png, title=f"Fold {fold} Prototype EDL Loss Curve")
+            save_loss_curve(history_df, history_png, title=f"EDL-Prototype k={args.edl_proto_k} - fold {fold}")
             save_proto_component_curve(
                 history_df,
                 history_component_png,
@@ -1810,7 +1862,7 @@ def main(args=None):
         all_history_png = output_dir / f"{data_stem}_all_folds_loss_curve_proto_edl.png"
         all_history_component_png = output_dir / f"{data_stem}_all_folds_loss_components_proto_edl.png"
         all_history_df.to_csv(all_history_csv, index=False)
-        save_all_folds_loss_curve(all_history_df, all_history_png, title="All Folds Prototype EDL Loss Curves")
+        save_all_folds_loss_curve(all_history_df, all_history_png, title=f"EDL-Prototype k={args.edl_proto_k}")
         save_all_proto_component_curves(
             all_history_df,
             all_history_component_png,

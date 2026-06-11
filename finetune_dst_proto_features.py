@@ -508,16 +508,17 @@ def save_loss_curve(history_df, output_path, title):
     except Exception as exc:
         print(f"[Plot] skipped: {exc}")
         return
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(history_df["epoch"], history_df["train_loss"], marker="o", label="train_eval_loss")
-    ax.plot(history_df["epoch"], history_df["val_loss"], marker="s", label="val_loss")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Loss")
-    ax.set_title(title)
-    ax.grid(True, linestyle="--", alpha=0.35)
-    ax.legend()
+    fig, ax = plt.subplots(figsize=(13.66, 7.68))
+    ax.plot(history_df["epoch"], history_df["train_loss"], color="#1f77b4", linewidth=2.5, label="train loss")
+    ax.plot(history_df["epoch"], history_df["val_loss"], color="#d62728", linewidth=2.5, label="val loss")
+    ax.set_xlabel("epoch", fontsize=14)
+    ax.set_ylabel("loss", fontsize=14)
+    ax.set_title(title, fontsize=16)
+    ax.grid(True, linestyle="-", alpha=0.3)
+    ax.legend(loc="upper right", fontsize=13)
+    ax.tick_params(axis="both", labelsize=12)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    fig.savefig(output_path, dpi=100)
     plt.close(fig)
 
 
@@ -579,18 +580,18 @@ def save_all_loss_curve(history_df, output_path, title):
     axes_flat = axes.flatten()
     for ax, fold in zip(axes_flat, folds):
         fold_df = history_df[history_df["fold"] == fold].sort_values("epoch")
-        ax.plot(fold_df["epoch"], fold_df["train_loss"], marker="o", label="train_eval_loss")
-        ax.plot(fold_df["epoch"], fold_df["val_loss"], marker="s", label="val_loss")
+        ax.plot(fold_df["epoch"], fold_df["train_loss"], color="#1f77b4", linewidth=2.5, label="train loss")
+        ax.plot(fold_df["epoch"], fold_df["val_loss"], color="#d62728", linewidth=2.5, label="val loss")
         ax.set_title(f"Fold {fold}")
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel("Loss")
-        ax.grid(True, linestyle="--", alpha=0.35)
-        ax.legend()
+        ax.set_xlabel("epoch")
+        ax.set_ylabel("loss")
+        ax.grid(True, linestyle="-", alpha=0.3)
+        ax.legend(loc="upper right")
     for ax in axes_flat[len(folds):]:
         ax.axis("off")
     fig.suptitle(title)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    fig.savefig(output_path, dpi=100)
     plt.close(fig)
 
 
@@ -1412,7 +1413,7 @@ def main(args=None):
             history_png = csv_output_dir / f"{data_stem}_fold{fold}_loss_curve_dst_proto.png"
             component_png = csv_output_dir / f"{data_stem}_fold{fold}_loss_components_dst_proto.png"
             history_df.to_csv(history_csv, index=False)
-            save_loss_curve(history_df, history_png, title=f"Fold {fold} DST-Prototype Loss Curve")
+            save_loss_curve(history_df, history_png, title=f"DST k={args.dst_proto_k} - fold {fold}")
             save_component_curve(history_df, component_png, title=f"Fold {fold} DST-Prototype Components")
             all_histories.append(history_df)
             print(f"  Saved fold history -> {history_csv}")
@@ -1430,7 +1431,7 @@ def main(args=None):
         all_history_png = csv_output_dir / f"{data_stem}_all_folds_loss_curve_dst_proto.png"
         all_component_png = csv_output_dir / f"{data_stem}_all_folds_loss_components_dst_proto.png"
         all_history.to_csv(all_history_csv, index=False)
-        save_all_loss_curve(all_history, all_history_png, title="All Folds DST-Prototype Loss Curves")
+        save_all_loss_curve(all_history, all_history_png, title=f"DST k={args.dst_proto_k}")
         save_all_component_curve(all_history, all_component_png, title="All Folds DST-Prototype Components")
         print(f"\n[Loss] All folds history saved -> {all_history_csv}")
         print(f"[Loss] All folds curves saved  -> {all_history_png}")
